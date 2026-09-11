@@ -1,0 +1,7 @@
+backend: pgf
+font.family: serif
+savefig.bbox: tight
+savefig.directory: out
+savefig.format: pdf
+text.usetex: True
+pgf.preamble: \usepackage{ctex}

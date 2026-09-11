@@ -1,0 +1,5 @@
+include = ["**/*.toml"]
+exclude = [".git/*", ".ruff_cache/*", ".venv/*", "node_modules/*", "out/*"]
+
+[formatting]
+reorder_arrays = true

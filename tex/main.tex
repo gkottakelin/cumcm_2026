@@ -1,0 +1,38 @@
+\documentclass[a4paper]{ctexart}
+
+\title{示例论文}
+\author{示例作者}
+\date{}
+
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{listings}
+\lstset{
+	basicstyle=\ttfamily,
+	numbers=left,
+	numberstyle=\tiny\ttfamily,
+	breaklines=true,
+}
+\usepackage[sort&compress]{gbt7714}
+
+\begin{document}
+\maketitle
+
+示例正文，如图~\ref{fig:example}~所示。Matplotlib 是一个广泛使用的 Python 绘图库~\cite{Hunter:2007}。
+
+\begin{figure}[htbp]
+	\centering
+	\includegraphics[width=\textwidth]{out/example.pdf}
+	\caption{示例图片标题，请在此处填写。}%
+	\label{fig:example}%
+\end{figure}
+
+\bibliographystyle{gbt7714-numeric}
+\bibliography{reference}
+
+\newpage
+\appendix
+\section{代码附录}
+\lstinputlisting[language=Python]{python-code/main.py}
+
+\end{document}

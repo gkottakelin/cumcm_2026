@@ -1,0 +1,19 @@
+ls:
+  .*: kebabcase
+  mk:
+    .*: exists:0
+    .mk: kebabcase
+  python-code:
+    .*: exists:0
+    .py: snakecase
+  tex:
+    .*: exists:0
+    .tex: regex:[a-z-]+
+
+ignore:
+  - .git
+  - .ruff_cache
+  - .venv
+  - AGENTS.md
+  - node_modules
+  - out

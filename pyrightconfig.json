@@ -1,0 +1,9 @@
+{
+  "typeCheckingMode": "strict",
+  "reportMissingTypeStubs": "none",
+  "reportUnknownArgumentType": "none",
+  "reportUnknownMemberType": "none",
+  "reportUnknownVariableType": "none",
+  "venvPath": ".",
+  "venv": ".venv"
+}

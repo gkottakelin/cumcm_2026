@@ -1,0 +1,13 @@
+---
+name: 添加功能
+description: 分配一个添加功能的任务
+title: "feature: "
+body:
+  - type: textarea
+    attributes:
+      label: 目标分支名/提交方法
+      description: 需要提交到的目标分支的名字/提交方法是什么
+  - type: textarea
+    attributes:
+      label: 功能描述
+      description: 需要完成的功能是什么
