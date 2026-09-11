@@ -3,3 +3,6 @@ name = "my-project"
 version = "0.1.0"
 requires-python = ">=3.14"
 dependencies = ["matplotlib >= 3.10.0", "numpy>=2.0.0"]
+
+[tool.deptry]
+known_first_party = ["coverage", "geometry", "localization"]
