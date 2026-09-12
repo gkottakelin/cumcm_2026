@@ -49,6 +49,7 @@ PROBLEM3 = 3
 PROBLEM4 = 4
 PROBLEM4_INTERIOR_STEP = 870.0
 PROBLEM4_POLAR_RADIUS = 1850.0
+PROBLEM4_SOURCE_COUNT = 16
 DEFAULT_SIMULATOR_DATA_DIR = (
     Path(__file__).resolve().parents[2]
     / "Jammers-simulator-win64"
@@ -625,6 +626,14 @@ class PracticeRunner:
                 position = center
         return order
 
+    def _detected_channel_count(self) -> int:
+        """Count channels that have proven active (bearing seen or cleared)."""
+        return sum(
+            1
+            for state in self.states.values()
+            if state.observations or state.cleared
+        )
+
     def run(self) -> tuple[list[int], list[int]]:
         coverage_points = self._coverage_points()
         total_points = len(coverage_points)
@@ -644,6 +653,20 @@ class PracticeRunner:
                     if not self.states[channel].cleared:
                         self._measure(point, channel)
                 self._schedule_clears(route)
+                if (
+                    self.problem == PROBLEM4
+                    and self._detected_channel_count() >= PROBLEM4_SOURCE_COUNT
+                ):
+                    # The problem fixes the number of Problem 4 sources at 16,
+                    # so detecting 16 distinct channels rules out any residual
+                    # source and the remaining coverage certificate stops
+                    # being necessary (model.md section 6.4).
+                    print(
+                        f"\n[early-stop] all {PROBLEM4_SOURCE_COUNT} sources "
+                        "detected; skipping remaining coverage points",
+                        flush=True,
+                    )
+                    break
             else:
                 _, point, channel = stop
                 state = self.states[channel]
