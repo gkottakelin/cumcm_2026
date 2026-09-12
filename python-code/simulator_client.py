@@ -23,13 +23,18 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 import numpy as np
+from shapely.geometry import Polygon as _ShapelyPolygon
+from shapely.geometry.base import BaseGeometry
 from geometry import (
     clip_convex_polygon_by_halfplane,
     direction_vector,
     regular_polygon_vertices,
     smallest_enclosing_circle,
 )
-from localization import intersect_with_sector, worst_case_diameter_after_second
+from localization import (
+    intersect_with_sector,
+    worst_case_diameter_after_second,
+)
 
 ARENA_RADIUS = 1800.0
 MAX_RECEIVE_RADIUS = 1500.0
@@ -48,7 +53,6 @@ DIRECTIONAL_LATERAL_FRACTIONS = (0.35, 0.65)
 DIRECTIONAL_LATERAL_OFFSETS = (250.0, 450.0)
 SAME_SIDE_PENALTY = 800.0
 COLLINEAR_PROBE_PENALTY = 50.0
-WALK_BRACKET_EPS = 20.0
 MEASURE_PLUS_SWITCH_SECONDS = 6.0
 CHANNELS = range(1, 21)
 PROBLEM3 = 3
@@ -212,13 +216,12 @@ class ChannelState:
     observations: list[tuple[np.ndarray, float]] = field(default_factory=list)
     cleared: bool = False
     attempts: int = 0
-    region: np.ndarray | None = None
+    region: BaseGeometry | None = None
     region_center: np.ndarray | None = None
     region_radius: float | None = None
     pending_clear: bool = False
     tried_viewpoints: list[np.ndarray] = field(default_factory=list)
-    walk_bracket: float | None = None
-    walk_bracket_obs: np.ndarray | None = None
+    no_signal_points: list[np.ndarray] = field(default_factory=list)
     lateral_failures: list[tuple[np.ndarray, float, int]] = field(
         default_factory=list
     )
@@ -266,6 +269,84 @@ def belief_region(observations: list[tuple[np.ndarray, float]]) -> np.ndarray:
         if len(polygon) == 0:
             return polygon
     return polygon
+
+
+_HALFPLANE_EXTENT: float = 9000.0
+
+
+def _halfplane_polygon(point: np.ndarray, normal: np.ndarray) -> _ShapelyPolygon:
+    """Halfplane {x : (x - point) . normal >= 0} as a far-extending rectangle."""
+    tangent = np.array([-normal[1], normal[0]])
+    centre = point + normal * (_HALFPLANE_EXTENT / 2.0)
+    return _ShapelyPolygon(
+        [
+            centre + normal * (_HALFPLANE_EXTENT / 2.0)
+            + tangent * (_HALFPLANE_EXTENT / 2.0),
+            centre - normal * (_HALFPLANE_EXTENT / 2.0)
+            + tangent * (_HALFPLANE_EXTENT / 2.0),
+            centre - normal * (_HALFPLANE_EXTENT / 2.0)
+            - tangent * (_HALFPLANE_EXTENT / 2.0),
+            centre + normal * (_HALFPLANE_EXTENT / 2.0)
+            - tangent * (_HALFPLANE_EXTENT / 2.0),
+        ]
+    )
+
+
+def belief_region_p3(
+    observations: list[tuple[np.ndarray, float]],
+    no_signal_points: list[np.ndarray],
+) -> _ShapelyPolygon | None:
+    """Non-convex Problem 3 belief region (shapely geometry).
+
+    Direction observations intersect the exact +-1 degree sector halfplanes
+    and a circumscribed 1500 m disk around the observation point.  Every
+    recorded no-signal point removes an *inscribed* 1000 m disk: an
+    omnidirectional source that was heard elsewhere must lie beyond its own
+    reception radius, which is at least 1000 m.  All approximations err on
+    the inclusive side, so the true source position always stays inside.
+    Returns None when the constraints are numerically inconsistent.
+    """
+    sides = 256
+    geometry: _ShapelyPolygon = _ShapelyPolygon(
+        regular_polygon_vertices(sides, ARENA_RADIUS / math.cos(math.pi / sides))
+    )
+    delta = math.radians(1.0)
+    for position, bearing in observations:
+        left = direction_vector(bearing - delta)
+        right = direction_vector(bearing + delta)
+        for normal in (np.array([-left[1], left[0]]),
+                       np.array([right[1], -right[0]])):
+            geometry = geometry.intersection(
+                _halfplane_polygon(position, normal)
+            )
+            if geometry.is_empty:
+                return None
+        disk = _ShapelyPolygon(
+            regular_polygon_vertices(
+                128, MAX_RECEIVE_RADIUS / math.cos(math.pi / 128), position
+            )
+        )
+        geometry = geometry.intersection(disk)
+        if geometry.is_empty:
+            return None
+    for point in no_signal_points:
+        ring = _ShapelyPolygon(
+            regular_polygon_vertices(
+                64, MIN_RECEIVE_RADIUS * math.cos(math.pi / 64), point
+            )
+        )
+        geometry = geometry.difference(ring)
+        if geometry.is_empty:
+            return None
+    return geometry
+
+
+def shapely_hull_vertices(geometry) -> np.ndarray:
+    """Convex-hull vertex array of a shapely geometry (for numpy routines)."""
+    hull = geometry.convex_hull
+    if hull.is_empty or hull.geom_type != "Polygon":
+        return np.empty((0, 2))
+    return np.asarray(hull.exterior.coords)[:-1]
 
 
 def _format_position(position: np.ndarray) -> str:
@@ -380,15 +461,32 @@ class PracticeRunner:
         state = self.states[channel]
         if not state.observations:
             return
-        region = belief_region(state.observations)
-        if len(region) == 0:
-            print(f"WARNING ch={channel:02d}: bearing intersection is empty")
-            state.region = region
-            state.region_center = None
-            state.region_radius = None
+        if self.problem == PROBLEM3:
+            # Non-convex: sector/disk intersections minus no-signal disks.
+            geometry = belief_region_p3(
+                state.observations, state.no_signal_points
+            )
+            if geometry is None:
+                print(
+                    f"WARNING ch={channel:02d}: p3 belief region is empty; "
+                    "keeping previous region"
+                )
+                return
+        else:
+            polygon = belief_region(state.observations)
+            if len(polygon) == 0:
+                print(f"WARNING ch={channel:02d}: bearing intersection is empty")
+                state.region = None
+                state.region_center = None
+                state.region_radius = None
+                return
+            geometry = _ShapelyPolygon(polygon)
+        vertices = shapely_hull_vertices(geometry)
+        if len(vertices) == 0:
+            print(f"WARNING ch={channel:02d}: belief region has no vertices")
             return
-        center, radius = smallest_enclosing_circle(region)
-        state.region = region
+        center, radius = smallest_enclosing_circle(vertices)
+        state.region = geometry
         state.region_center = center
         state.region_radius = radius
 
@@ -410,49 +508,18 @@ class PracticeRunner:
         return center, radius
 
     def _apply_no_signal(self, channel: int, position: np.ndarray) -> None:
-        """Problem 3 only: a detected omnidirectional source must be > 1000 m away."""
+        """Problem 3: record the point and shrink the (non-convex) region.
+
+        A no-signal point stays useful even before the channel is detected:
+        once a later bearing confirms an omnidirectional source exists, the
+        recorded point proves the source is farther than 1000 m away.
+        """
         if self.problem != PROBLEM3:
             return
         state = self.states[channel]
-        if not state.observations or state.region is None or len(state.region) == 0:
-            return
-        updated = self._exclude_reception_disk(state.region, position)
-        if len(updated) == 0:
-            print(
-                f"WARNING ch={channel:02d}: no-signal exclusion emptied the "
-                "region; keeping previous region"
-            )
-            return
-        state.region = updated
-        center, radius = smallest_enclosing_circle(updated)
-        state.region_center = center
-        state.region_radius = radius
-
-    def _exclude_reception_disk(
-        self,
-        polygon: np.ndarray,
-        center: np.ndarray,
-        radius: float = MIN_RECEIVE_RADIUS,
-        sides: int = 64,
-    ) -> np.ndarray:
-        """Remove the reception disk around `center` from a convex polygon.
-
-        Tangent halfplanes sit on a ring whose circumscribed polygon has
-        circumradius exactly `radius`, so only points strictly inside the disk
-        are removed and the true source position cannot be excluded.
-        """
-        if len(polygon) == 0:
-            return polygon
-        ring_radius = radius * math.cos(math.pi / sides)
-        result = polygon
-        for k in range(sides):
-            angle = 2.0 * math.pi * k / sides
-            outward = np.array([math.cos(angle), math.sin(angle)])
-            point = center + ring_radius * outward
-            result = clip_convex_polygon_by_halfplane(result, point, outward)
-            if len(result) == 0:
-                break
-        return result
+        state.no_signal_points.append(position.copy())
+        if state.observations:
+            self._refresh_region(channel)
 
     def _schedule_clears(self, route: list[tuple]) -> None:
         """Insert clear stops for every channel whose region is safe to clear."""
@@ -503,8 +570,8 @@ class PracticeRunner:
         if state.cleared or not state.observations:
             return state.cleared
 
-        # Problem 4 probes may walk a bracketed line in shrinking steps, so
-        # they get a larger step budget than Problem 3.
+        # Problem 4 probes use structured candidates and side-flip ranking,
+        # so they get a larger step budget than Problem 3.
         max_steps = 14 if self.problem == PROBLEM4 else 10
         for _step in range(max_steps):
             center, radius = self._region_status(channel)
@@ -536,7 +603,11 @@ class PracticeRunner:
     def _choose_viewpoint(self, channel: int) -> np.ndarray | None:
         """Pick the next measurement point by minimax shrink plus travel cost."""
         state = self.states[channel]
-        if state.region is None or len(state.region) < 3:
+        if (
+            state.region is None
+            or state.region.is_empty
+            or state.region_center is None
+        ):
             if state.observations:
                 position, bearing = state.observations[-1]
                 fallback = position + 600.0 * direction_vector(bearing)
@@ -559,7 +630,6 @@ class PracticeRunner:
                     candidate = _inside_arena(candidate)
                 scored.append((candidate, True, 1e9, 0, "approach"))
         scored.append((self.current_position.copy(), False, 1e9, 0, "current"))
-        bracket: float | None = None
         latest_position: np.ndarray | None = None
         latest_forward: np.ndarray | None = None
         if self.problem == PROBLEM3:
@@ -572,36 +642,23 @@ class PracticeRunner:
                         (_inside_arena(candidate), False, 1e9, 0, "ring")
                     )
         else:
-            # Problem 4 structured probes in the latest-bearing frame.  A
-            # walk point beyond the source is provably back-plane, so a
-            # no-signal walk brackets the source depth; lateral pairs from
-            # any anchor at depth <= |source| have a guaranteed receivable
-            # side (max(x+y, x-y) >= x >= 0).
+            # Problem 4 structured probes in the latest-bearing frame: walk
+            # candidates advance along the bearing line and lateral pairs
+            # straddle it.  With +-1 degree bearing error these are ranking
+            # heuristics only -- no depth bracket is inferred from a
+            # no-signal walk (the half-plane argument breaks near the
+            # emission boundary), and the clear certificate never depends
+            # on probe outcomes.
             latest_position, latest_bearing = state.observations[-1]
             forward = direction_vector(latest_bearing)
             latest_forward = forward
             lateral_dir = np.array([-forward[1], forward[0]])
-            if (
-                state.walk_bracket_obs is not None
-                and np.allclose(state.walk_bracket_obs, latest_position)
-            ):
-                bracket = state.walk_bracket
             walk_depths = list(DIRECTIONAL_WALK_OFFSETS)
             anchor_depths = list(DIRECTIONAL_ANCHOR_OFFSETS)
-            if bracket is not None:
-                # Short halving probes only appear once a no-signal walk has
-                # bracketed the source depth; unrestricted short walks would
-                # let cheap collinear steps crowd out crossing laterals.
-                walk_depths += [max(bracket / 2.0, 40.0), max(bracket / 4.0, 40.0)]
-                anchor_depths += [max(bracket / 2.0, 15.0), max(bracket / 4.0, 15.0)]
             for depth in walk_depths:
-                if bracket is not None and depth > bracket - WALK_BRACKET_EPS:
-                    continue
                 point = latest_position + depth * forward
                 scored.append((point, True, depth, 0, "walk"))
             for depth in anchor_depths:
-                if bracket is not None and depth > bracket - WALK_BRACKET_EPS:
-                    continue
                 anchor = latest_position + depth * forward
                 for offset in DIRECTIONAL_LATERAL_OFFSETS:
                     scored.append(
@@ -615,8 +672,6 @@ class PracticeRunner:
                     center - latest_position
                 )
                 depth = float(np.dot(anchor - latest_position, forward))
-                if bracket is not None and depth > bracket - WALK_BRACKET_EPS:
-                    continue
                 for offset in DIRECTIONAL_LATERAL_OFFSETS:
                     scored.append(
                         (anchor + offset * lateral_dir, True, depth, 1, "lateral")
@@ -627,6 +682,11 @@ class PracticeRunner:
         best: np.ndarray | None = None
         best_meta: tuple[str, float, int] | None = None
         best_score = float("inf")
+        # Convex-hull vertices bound the (possibly non-convex) region for the
+        # numpy scoring routines; the clear certificate itself always uses
+        # the exact shapely region via shapely_hull_vertices in
+        # _refresh_region, which covers every component.
+        hull_vertices = shapely_hull_vertices(state.region)
         for candidate, is_safe, depth, side, kind in scored:
             if any(
                 float(np.linalg.norm(candidate - tried)) <= 50.0
@@ -641,7 +701,8 @@ class PracticeRunner:
             penalty = 0.0
             if not is_safe:
                 worst_receive = max(
-                    float(np.linalg.norm(candidate - vertex)) for vertex in state.region
+                    float(np.linalg.norm(candidate - vertex))
+                    for vertex in hull_vertices
                 )
                 if worst_receive > 1150.0:
                     continue
@@ -676,7 +737,7 @@ class PracticeRunner:
                     if alignment > 0.906:  # within ~25 degrees of the bearing
                         penalty += COLLINEAR_PROBE_PENALTY
             move_time = float(np.linalg.norm(candidate - self.current_position)) / 5.0
-            predicted = worst_case_diameter_after_second(state.region, candidate)
+            predicted = worst_case_diameter_after_second(hull_vertices, candidate)
             score = predicted + VIEWPOINT_MOVE_WEIGHT * move_time + penalty
             if score < best_score:
                 best = candidate
@@ -695,51 +756,25 @@ class PracticeRunner:
         return best
 
     def _record_probe_failure(self, channel: int, target: np.ndarray) -> None:
-        """Turn a Problem 4 no-signal probe into structural information."""
+        """Turn a Problem 4 no-signal probe into ranking information."""
         state = self.states[channel]
         probe = state.pending_probe
         state.pending_probe = None
         if probe is None or self.problem != PROBLEM4:
             return
-        kind, depth, side, _distance = probe
-        if not state.observations:
-            return
-        latest_position = state.observations[-1][0]
-        if kind == "walk":
-            # A walk point beyond the source is provably back-plane (the
-            # segment up to the source stays in the emitting half-plane and
-            # in reception range), so the source lies at a smaller depth.
-            if state.walk_bracket is None or depth < state.walk_bracket:
-                state.walk_bracket = depth
-                state.walk_bracket_obs = latest_position.copy()
-        elif side != 0:
-            state.lateral_failures.append((latest_position.copy(), depth, side))
+        _kind, _depth, side, _distance = probe
+        if side != 0 and state.observations:
+            # A failed lateral only marks its side of the bearing line as
+            # *likely* back-plane; with +-1 degree bearing error this is a
+            # ranking heuristic, not a proof, so no depth bracket is kept.
+            latest_position = state.observations[-1][0]
+            state.lateral_failures.append((latest_position.copy(), _depth, side))
 
     def _advance_probe_frame(self, channel: int) -> None:
-        """Update Problem 4 probe memory after a successful measurement."""
+        """Reset Problem 4 probe memory after a successful measurement."""
         state = self.states[channel]
-        probe = state.pending_probe
         state.pending_probe = None
         state.lateral_failures.clear()
-        if self.problem != PROBLEM4 or probe is None:
-            state.walk_bracket = None
-            state.walk_bracket_obs = None
-            return
-        kind, depth, _side, _distance = probe
-        if (
-            kind == "walk"
-            and state.walk_bracket is not None
-            and state.walk_bracket_obs is not None
-            and len(state.observations) >= 2
-            and np.allclose(state.walk_bracket_obs, state.observations[-2][0])
-        ):
-            # The new observation is a walk point on the bracketed line, so
-            # the remaining depth bound shrinks by the walked distance.
-            state.walk_bracket = max(state.walk_bracket - depth, 10.0)
-            state.walk_bracket_obs = state.observations[-1][0].copy()
-        else:
-            state.walk_bracket = None
-            state.walk_bracket_obs = None
 
     def _refinement_order(self, detected: list[int]) -> list[int]:
         """Visit remaining channels by region center with a 2-opt tour."""

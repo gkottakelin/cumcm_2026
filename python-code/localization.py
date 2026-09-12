@@ -135,6 +135,14 @@ def worst_case_diameter_after_second(
     delta: float = DELTA_RAD,
     n_angle_samples: int = 36,
 ) -> float:
+    """Worst-case remaining diameter when measuring at `candidate_s`.
+
+    For every representative source position in the region, the reported
+    bearing may deviate by up to +-delta, so the score takes the maximum
+    remaining diameter over the error endpoints and the error-free line.
+    This is a conservative *ranking* heuristic; clear certificates never
+    use it.
+    """
     if len(region_poly) < 2:
         return 0.0
     test_points = list(region_poly)
@@ -147,9 +155,10 @@ def worst_case_diameter_after_second(
     max_d = 0.0
     for g in test_points:
         theta_g = float(np.arctan2(g[1] - candidate_s[1], g[0] - candidate_s[0]))
-        poly = intersect_with_sector(region_poly, candidate_s, theta_g, delta)
-        d = polygon_diameter(poly) if len(poly) >= 2 else 0.0
-        max_d = max(max_d, d)
+        for error in (-delta, 0.0, delta):
+            poly = intersect_with_sector(region_poly, candidate_s, theta_g + error)
+            d = polygon_diameter(poly) if len(poly) >= 2 else 0.0
+            max_d = max(max_d, d)
     return max_d
 
 
