@@ -747,33 +747,53 @@ class PracticeRunner:
             state.walk_bracket_obs = None
 
     def _refinement_order(self, detected: list[int]) -> list[int]:
-        """Visit remaining channels nearest-region-center first from the robot."""
-        remaining = [
-            channel
-            for channel in detected
-            if not self.states[channel].cleared and self.states[channel].observations
-        ]
+        """Visit remaining channels by region center with a 2-opt tour."""
+        centers: dict[int, np.ndarray] = {}
+        fallback: list[int] = []
+        remaining = []
+        for channel in detected:
+            state = self.states[channel]
+            if state.cleared or not state.observations:
+                continue
+            if state.region_center is None:
+                fallback.append(channel)
+                continue
+            centers[channel] = state.region_center
+            remaining.append(channel)
+        # greedy nearest-neighbour seed
         order: list[int] = []
         position = self.current_position.copy()
         while remaining:
-            best_channel = None
-            best_distance = float("inf")
-            for channel in remaining:
-                center = self.states[channel].region_center
-                if center is None:
-                    continue
-                distance = float(np.linalg.norm(position - center))
-                if distance < best_distance:
-                    best_distance = distance
-                    best_channel = channel
-            if best_channel is None:
-                best_channel = remaining[0]
+            best_channel = min(
+                remaining,
+                key=lambda ch: float(np.linalg.norm(position - centers[ch])),
+            )
             order.append(best_channel)
             remaining.remove(best_channel)
-            center = self.states[best_channel].region_center
-            if center is not None:
-                position = center
-        return order
+            position = centers[best_channel]
+        if len(order) < 3:
+            return order + fallback
+        # 2-opt: reverse segments when it shortens the center-to-center path
+        # starting from the robot's current position.
+        start = self.current_position
+        improved = True
+        while improved:
+            improved = False
+            for i in range(len(order) - 1):
+                for j in range(i + 1, len(order)):
+                    a = start if i == 0 else centers[order[i - 1]]
+                    b, c = centers[order[i]], centers[order[j]]
+                    d = centers[order[j + 1]] if j + 1 < len(order) else None
+                    current = float(np.linalg.norm(a - b)) + (
+                        float(np.linalg.norm(c - d)) if d is not None else 0.0
+                    )
+                    candidate = float(np.linalg.norm(a - c)) + (
+                        float(np.linalg.norm(b - d)) if d is not None else 0.0
+                    )
+                    if candidate < current - 1e-9:
+                        order[i : j + 1] = reversed(order[i : j + 1])
+                        improved = True
+        return order + fallback
 
     def _detected_channel_count(self) -> int:
         """Count channels that have proven active (bearing seen or cleared)."""
