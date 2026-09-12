@@ -35,7 +35,10 @@ ARENA_RADIUS = 1800.0
 MAX_RECEIVE_RADIUS = 1500.0
 MIN_RECEIVE_RADIUS = 1000.0
 CLEAR_RADIUS = 20.0
-SAFE_CLEAR_RADIUS = 18.0
+# Any threshold below CLEAR_RADIUS is provably safe: the belief region always
+# contains the true source and its enclosing-circle radius bounds the clear
+# distance.  19.5 keeps a 0.5 m margin against floating-point noise.
+SAFE_CLEAR_RADIUS = 19.5
 VIEWPOINT_MOVE_WEIGHT = 1.0
 VIEWPOINT_RING_FACTORS = (0.5, 0.75, 1.0, 1.3)
 VIEWPOINT_ANGLES = 16
