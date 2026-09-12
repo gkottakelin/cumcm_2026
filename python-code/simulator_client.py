@@ -43,9 +43,12 @@ VIEWPOINT_MOVE_WEIGHT = 1.0
 VIEWPOINT_RING_FACTORS = (0.5, 0.75, 1.0, 1.3)
 VIEWPOINT_ANGLES = 16
 DIRECTIONAL_WALK_OFFSETS = (350.0, 700.0, 1050.0)
+DIRECTIONAL_ANCHOR_OFFSETS = (30.0, 100.0, 200.0)
 DIRECTIONAL_LATERAL_FRACTIONS = (0.35, 0.65)
 DIRECTIONAL_LATERAL_OFFSETS = (250.0, 450.0)
 SAME_SIDE_PENALTY = 800.0
+COLLINEAR_PROBE_PENALTY = 50.0
+WALK_BRACKET_EPS = 20.0
 MEASURE_PLUS_SWITCH_SECONDS = 6.0
 CHANNELS = range(1, 21)
 PROBLEM3 = 3
@@ -211,7 +214,12 @@ class ChannelState:
     region_radius: float | None = None
     pending_clear: bool = False
     tried_viewpoints: list[np.ndarray] = field(default_factory=list)
-    no_signal_viewpoints: list[np.ndarray] = field(default_factory=list)
+    walk_bracket: float | None = None
+    walk_bracket_obs: np.ndarray | None = None
+    lateral_failures: list[tuple[np.ndarray, float, int]] = field(
+        default_factory=list
+    )
+    pending_probe: tuple[str, float, int, float] | None = None
 
 
 def _inside_arena(point: np.ndarray, margin: float = 2.0) -> np.ndarray:
@@ -261,11 +269,15 @@ def _format_position(position: np.ndarray) -> str:
     return f"({position[0]:.1f}, {position[1]:.1f})"
 
 
-def _nearest_neighbor_tour(points: list[np.ndarray]) -> list[np.ndarray]:
-    """Order scan points by greedy nearest neighbour starting at the origin."""
+def _nearest_neighbor_tour(
+    points: list[np.ndarray], start: np.ndarray | None = None
+) -> list[np.ndarray]:
+    """Order scan points by greedy nearest neighbour starting at `start`."""
+    if start is None:
+        start = np.array([0.0, 0.0])
     remaining = list(points)
     tour: list[np.ndarray] = []
-    current = np.array([0.0, 0.0])
+    current = start
     while remaining:
         distances = [float(np.linalg.norm(current - p)) for p in remaining]
         index = int(np.argmin(distances))
@@ -342,8 +354,13 @@ class PracticeRunner:
         # convex hull of scan points within 980 m (verified numerically on
         # a 5 m sampling grid plus a dense edge annulus), so by the convex
         # combination argument any 180-degree emission half-plane contains
-        # a scan point within the 1000 m guaranteed reception radius.  A
-        # nearest-neighbour tour from the origin shortens the route.
+        # a scan point within the 1000 m guaranteed reception radius.
+        # Tour order (tuning report iter-005): the inner 3x3 runs first --
+        # its 1000 m disks cover the whole arena, so every omnidirectional
+        # source is found within the first nine stops -- then the outer 20
+        # points as one loop.  With the 16-source early stop only the
+        # detection prefix matters; this order reaches it about 2.5 km
+        # sooner than a plain nearest-neighbour tour.
         step = PROBLEM4_INTERIOR_STEP
         coords = (-2.0 * step, -step, 0.0, step, 2.0 * step)
         points = [np.array([x, y]) for y in coords for x in coords]
@@ -353,7 +370,15 @@ class PracticeRunner:
         points.extend(
             np.array([0.0, sy * PROBLEM4_POLAR_RADIUS]) for sy in (1.0, -1.0)
         )
-        return _nearest_neighbor_tour(points)
+        def _inner(point: np.ndarray) -> bool:
+            return max(abs(float(point[0])), abs(float(point[1]))) <= step + 1e-9
+
+        inner = [p for p in points if _inner(p)]
+        outer = [p for p in points if not _inner(p)]
+        tour = _nearest_neighbor_tour(inner)
+        return tour + _nearest_neighbor_tour(
+            outer, tour[-1] if tour else np.array([0.0, 0.0])
+        )
 
     def _refresh_region(self, channel: int) -> None:
         """Recompute the cached belief region from all stored observations."""
@@ -483,7 +508,10 @@ class PracticeRunner:
         if state.cleared or not state.observations:
             return state.cleared
 
-        for _step in range(10):
+        # Problem 4 probes may walk a bracketed line in shrinking steps, so
+        # they get a larger step budget than Problem 3.
+        max_steps = 14 if self.problem == PROBLEM4 else 10
+        for _step in range(max_steps):
             center, radius = self._region_status(channel)
             if (
                 center is not None
@@ -500,8 +528,10 @@ class PracticeRunner:
             if state.cleared:
                 return True
             if outcome == "no_signal":
-                state.no_signal_viewpoints.append(target.copy())
+                self._record_probe_failure(channel, target)
                 print(f"REFINE  ch={channel:02d}: no bearing at this viewpoint")
+            elif outcome == "direction":
+                self._advance_probe_frame(channel)
 
         center, radius = self._region_status(channel)
         if center is not None and radius is not None and radius <= CLEAR_RADIUS:
@@ -520,10 +550,11 @@ class PracticeRunner:
         center = state.region_center
         distance = float(np.linalg.norm(self.current_position - center))
         base = min(max(0.6 * distance, 250.0), 800.0)
-        # Safe candidates move from a proven observation point toward the
-        # estimated source: staying near the observation-to-source line keeps
-        # the robot inside a directional source's emitting half-plane.
-        safe_candidates: list[np.ndarray] = []
+        # Candidates carry (point, is_safe, depth, side, kind) where depth and
+        # side are measured in the latest-bearing frame of Problem 4 probes.
+        scored: list[tuple[np.ndarray, bool, float, int, str]] = []
+        # Safe approach candidates move from a proven observation point toward
+        # the estimated source, staying inside a directional half-plane.
         for observed_position, _ in state.observations[-3:]:
             for fraction in (0.35, 0.55, 0.75):
                 candidate = observed_position + fraction * (
@@ -531,39 +562,77 @@ class PracticeRunner:
                 )
                 if self.problem == PROBLEM3:
                     candidate = _inside_arena(candidate)
-                safe_candidates.append(candidate)
-        risky_candidates: list[np.ndarray] = [self.current_position.copy()]
+                scored.append((candidate, True, 1e9, 0, "approach"))
+        scored.append((self.current_position.copy(), False, 1e9, 0, "current"))
+        bracket: float | None = None
+        latest_position: np.ndarray | None = None
+        latest_forward: np.ndarray | None = None
         if self.problem == PROBLEM3:
             for factor in VIEWPOINT_RING_FACTORS:
                 ring = base * factor
                 for k in range(VIEWPOINT_ANGLES):
                     angle = 2.0 * math.pi * k / VIEWPOINT_ANGLES
                     candidate = center + ring * direction_vector(angle)
-                    risky_candidates.append(_inside_arena(candidate))
+                    scored.append(
+                        (_inside_arena(candidate), False, 1e9, 0, "ring")
+                    )
         else:
-            # Problem 4 structured probes: walking the latest bearing line
-            # stays inside the emitting half-plane up to the source, and from
-            # any safe point at least one of the two lateral offsets is
-            # guaranteed receivable (max(x+y, x-y) >= x >= 0).
+            # Problem 4 structured probes in the latest-bearing frame.  A
+            # walk point beyond the source is provably back-plane, so a
+            # no-signal walk brackets the source depth; lateral pairs from
+            # any anchor at depth <= |source| have a guaranteed receivable
+            # side (max(x+y, x-y) >= x >= 0).
             latest_position, latest_bearing = state.observations[-1]
             forward = direction_vector(latest_bearing)
-            lateral = np.array([-forward[1], forward[0]])
-            for offset in DIRECTIONAL_WALK_OFFSETS:
-                safe_candidates.append(latest_position + offset * forward)
+            latest_forward = forward
+            lateral_dir = np.array([-forward[1], forward[0]])
+            if (
+                state.walk_bracket_obs is not None
+                and np.allclose(state.walk_bracket_obs, latest_position)
+            ):
+                bracket = state.walk_bracket
+            walk_depths = list(DIRECTIONAL_WALK_OFFSETS)
+            anchor_depths = list(DIRECTIONAL_ANCHOR_OFFSETS)
+            if bracket is not None:
+                # Short halving probes only appear once a no-signal walk has
+                # bracketed the source depth; unrestricted short walks would
+                # let cheap collinear steps crowd out crossing laterals.
+                walk_depths += [max(bracket / 2.0, 40.0), max(bracket / 4.0, 40.0)]
+                anchor_depths += [max(bracket / 2.0, 15.0), max(bracket / 4.0, 15.0)]
+            for depth in walk_depths:
+                if bracket is not None and depth > bracket - WALK_BRACKET_EPS:
+                    continue
+                point = latest_position + depth * forward
+                scored.append((point, True, depth, 0, "walk"))
+            for depth in anchor_depths:
+                if bracket is not None and depth > bracket - WALK_BRACKET_EPS:
+                    continue
+                anchor = latest_position + depth * forward
+                for offset in DIRECTIONAL_LATERAL_OFFSETS:
+                    scored.append(
+                        (anchor + offset * lateral_dir, True, depth, 1, "lateral")
+                    )
+                    scored.append(
+                        (anchor - offset * lateral_dir, True, depth, -1, "lateral")
+                    )
             for fraction in DIRECTIONAL_LATERAL_FRACTIONS:
                 anchor = latest_position + fraction * (
                     center - latest_position
                 )
-                for lateral_offset in DIRECTIONAL_LATERAL_OFFSETS:
-                    safe_candidates.append(anchor + lateral_offset * lateral)
-                    safe_candidates.append(anchor - lateral_offset * lateral)
-        scored: list[tuple[np.ndarray, bool]] = [
-            *[(candidate, False) for candidate in risky_candidates],
-            *[(candidate, True) for candidate in safe_candidates],
-        ]
+                depth = float(np.dot(anchor - latest_position, forward))
+                if bracket is not None and depth > bracket - WALK_BRACKET_EPS:
+                    continue
+                for offset in DIRECTIONAL_LATERAL_OFFSETS:
+                    scored.append(
+                        (anchor + offset * lateral_dir, True, depth, 1, "lateral")
+                    )
+                    scored.append(
+                        (anchor - offset * lateral_dir, True, depth, -1, "lateral")
+                    )
         best: np.ndarray | None = None
+        best_meta: tuple[str, float, int] | None = None
         best_score = float("inf")
-        for candidate, is_safe in scored:
+        for candidate, is_safe, depth, side, kind in scored:
             if any(
                 float(np.linalg.norm(candidate - tried)) <= 50.0
                 for tried in state.tried_viewpoints
@@ -582,23 +651,100 @@ class PracticeRunner:
                 if worst_receive > 1150.0:
                     continue
                 penalty += 0.5 * max(0.0, worst_receive - MIN_RECEIVE_RADIUS)
-            if self.problem == PROBLEM4 and state.no_signal_viewpoints:
-                # A no-signal probe marks its side of the region as likely
-                # back-plane; prefer flipping to the opposite side.
-                for failed in state.no_signal_viewpoints:
-                    if float(np.dot(candidate - center, failed - center)) > 0.0:
-                        penalty += SAME_SIDE_PENALTY
-                        break
+            if side != 0 and latest_position is not None:
+                # Failed laterals mark their side of the bearing line as
+                # back-plane; after two failures on one side, avoid that
+                # side entirely, otherwise only nearby depths.
+                same_side = [
+                    failed_depth
+                    for obs_pos, failed_depth, failed_side in state.lateral_failures
+                    if failed_side == side and np.allclose(obs_pos, latest_position)
+                ]
+                if len(same_side) >= 2 or (
+                    same_side
+                    and any(
+                        abs(failed_depth - depth) <= 150.0
+                        for failed_depth in same_side
+                    )
+                ):
+                    penalty += SAME_SIDE_PENALTY
+            if latest_forward is not None:
+                # A probe nearly collinear with the latest bearing shrinks a
+                # small region only marginally, yet cheap collinear hops can
+                # crowd out crossing laterals in the greedy score.
+                to_center = center - candidate
+                norm_to_center = float(np.linalg.norm(to_center))
+                if norm_to_center > 1e-9:
+                    alignment = abs(
+                        float(np.dot(to_center / norm_to_center, latest_forward))
+                    )
+                    if alignment > 0.906:  # within ~25 degrees of the bearing
+                        penalty += COLLINEAR_PROBE_PENALTY
             move_time = float(np.linalg.norm(candidate - self.current_position)) / 5.0
             predicted = worst_case_diameter_after_second(state.region, candidate)
             score = predicted + VIEWPOINT_MOVE_WEIGHT * move_time + penalty
             if score < best_score:
                 best = candidate
+                best_meta = (kind, depth, side)
                 best_score = score
         if best is None:
             return None
         state.tried_viewpoints.append(best.copy())
+        assert best_meta is not None
+        state.pending_probe = (
+            best_meta[0],
+            best_meta[1],
+            best_meta[2],
+            float(np.linalg.norm(best - self.current_position)),
+        )
         return best
+
+    def _record_probe_failure(self, channel: int, target: np.ndarray) -> None:
+        """Turn a Problem 4 no-signal probe into structural information."""
+        state = self.states[channel]
+        probe = state.pending_probe
+        state.pending_probe = None
+        if probe is None or self.problem != PROBLEM4:
+            return
+        kind, depth, side, _distance = probe
+        if not state.observations:
+            return
+        latest_position = state.observations[-1][0]
+        if kind == "walk":
+            # A walk point beyond the source is provably back-plane (the
+            # segment up to the source stays in the emitting half-plane and
+            # in reception range), so the source lies at a smaller depth.
+            if state.walk_bracket is None or depth < state.walk_bracket:
+                state.walk_bracket = depth
+                state.walk_bracket_obs = latest_position.copy()
+        elif side != 0:
+            state.lateral_failures.append((latest_position.copy(), depth, side))
+
+    def _advance_probe_frame(self, channel: int) -> None:
+        """Update Problem 4 probe memory after a successful measurement."""
+        state = self.states[channel]
+        probe = state.pending_probe
+        state.pending_probe = None
+        state.lateral_failures.clear()
+        if self.problem != PROBLEM4 or probe is None:
+            state.walk_bracket = None
+            state.walk_bracket_obs = None
+            return
+        kind, depth, _side, _distance = probe
+        if (
+            kind == "walk"
+            and state.walk_bracket is not None
+            and state.walk_bracket_obs is not None
+            and len(state.observations) >= 2
+            and np.allclose(state.walk_bracket_obs, state.observations[-2][0])
+        ):
+            # The new observation is a walk point on the bracketed line, so
+            # the remaining depth bound shrinks by the walked distance.
+            state.walk_bracket = max(state.walk_bracket - depth, 10.0)
+            state.walk_bracket_obs = state.observations[-1][0].copy()
+        else:
+            state.walk_bracket = None
+            state.walk_bracket_obs = None
 
     def _refinement_order(self, detected: list[int]) -> list[int]:
         """Visit remaining channels nearest-region-center first from the robot."""
