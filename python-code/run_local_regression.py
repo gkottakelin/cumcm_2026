@@ -16,7 +16,6 @@ import time
 from pathlib import Path
 from typing import Any, Final
 
-import numpy as np
 from local_test_simulator import (
     DEFAULT_LOCAL_PORT,
     OFFICIAL_PORT,
@@ -39,14 +38,9 @@ def _run_case(
     *,
     verbose: bool,
 ) -> dict[str, Any]:
-    rng = np.random.default_rng(seed)
-    source_count = int(rng.integers(10, 17)) if problem == PROBLEM3 else 16
-    directional_count = 0 if problem == PROBLEM3 else 5
-    simulator = LocalSimulator(
-        problem,
-        seed,
-        source_count=source_count,
-        directional_count=directional_count,
+    simulator = LocalSimulator(problem, seed)
+    directional_count = sum(
+        jammer.source_type == "directional" for jammer in simulator.jammers
     )
 
     with tempfile.TemporaryDirectory(prefix="jammers-local-test-") as temporary:

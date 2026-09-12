@@ -6,7 +6,7 @@ test harness can detect missed (rather than merely uncleared) jammers.
 """
 
 # The CLI prints operator-facing status information.
-# ruff: noqa: CPY001, EM101, T201, TRY003
+# ruff: noqa: A002, ANN401, BLE001, CPY001, EM101, EM102, N815, PLR0911, PLR2004, T201, TRY003
 
 from __future__ import annotations
 
@@ -15,11 +15,13 @@ import hashlib
 import json
 import math
 import threading
+import time
+import unicodedata
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, ClassVar, Final
+from typing import Any, ClassVar, Final, cast
 
 import numpy as np
 
@@ -40,10 +42,38 @@ CLEAR_FAILURE_DURATION: Final = 3.0
 BEARING_ERROR_LIMIT_DEG: Final = 1.0
 FLOAT_TOLERANCE: Final = 1e-9
 CHANNELS: Final = tuple(range(1, 21))
+MIN_SOURCE_COUNT: Final = 10
+MAX_SOURCE_COUNT: Final = 16
+INITIAL_CHANNEL: Final = 1
+MAX_COORDINATE_ABS: Final = 2_000_000.0
+MAX_REQUEST_BYTES: Final = 65_536
+MAX_JSON_NESTING: Final = 16
+MAX_VIRTUAL_DURATION_S: Final = 360_000.0
+MAX_REAL_DURATION_S: Final = 1_200
 
 
 class LocalSimulatorError(RuntimeError):
     """Raised when a local test request violates the simulator protocol."""
+
+
+class ProtocolValidationError(LocalSimulatorError):
+    """Raised for malformed requests that the official API reports as HTTP 400."""
+
+
+class BusinessRuleError(LocalSimulatorError):
+    """Raised for well-formed requests rejected with HTTP 200/accepted=false."""
+
+
+class RequestConflictError(LocalSimulatorError):
+    """Raised when a used request_id is reused with different request content."""
+
+
+class PayloadTooLargeError(LocalSimulatorError):
+    """Raised when the JSON request body exceeds the documented byte limit."""
+
+
+class UnsupportedMediaTypeError(LocalSimulatorError):
+    """Raised when HTTP content metadata violates the documented protocol."""
 
 
 @dataclass
@@ -70,7 +100,7 @@ class Jammer:
             return False
         if self.source_type == "directional":
             if self.emission_direction_deg is None:
-                raise LocalSimulatorError("directional jammer has no direction")
+                raise RuntimeError("directional jammer has no direction")
             angle = math.radians(self.emission_direction_deg)
             direction = np.array([math.cos(angle), math.sin(angle)])
             return float(np.dot(direction, displacement)) >= -FLOAT_TOLERANCE
@@ -110,15 +140,20 @@ def generate_case(
         raise ValueError("problem must be 3 or 4")
     rng = np.random.default_rng(seed)
     if source_count is None:
-        source_count = 13 if problem == PROBLEM3 else 16
-    if not 1 <= source_count <= len(CHANNELS):
-        raise ValueError("source_count must be between 1 and 20")
+        source_count = int(rng.integers(MIN_SOURCE_COUNT, MAX_SOURCE_COUNT + 1))
+    if not MIN_SOURCE_COUNT <= source_count <= MAX_SOURCE_COUNT:
+        raise ValueError("source_count must be between 10 and 16")
     if directional_count is None:
-        directional_count = 0 if problem == PROBLEM3 else 5
+        directional_count = (
+            0 if problem == PROBLEM3 else int(rng.integers(1, source_count))
+        )
     if problem == PROBLEM3 and directional_count != 0:
         raise ValueError("Problem 3 may contain only omnidirectional sources")
-    if not 0 <= directional_count <= source_count:
-        raise ValueError("directional_count must be between 0 and source_count")
+    if problem == PROBLEM4 and not 1 <= directional_count < source_count:
+        raise ValueError(
+            "Problem 4 must contain at least one omnidirectional and one "
+            "directional source"
+        )
 
     selected_channels = rng.choice(CHANNELS, size=source_count, replace=False)
     source_types = ["directional"] * directional_count + ["omnidirectional"] * (
@@ -170,8 +205,9 @@ class LocalSimulator:
         self.exited = False
         self.robot_id: str | None = None
         self.robot_position = np.array([0.0, 0.0])
-        self.current_channel: int | None = None
-        self.seen_request_ids: set[str] = set()
+        self.current_channel = INITIAL_CHANNEL
+        self.request_records: dict[str, tuple[str, str, dict[str, Any]]] = {}
+        self.entered_monotonic_s: float | None = None
         self.command_log: list[dict[str, Any]] = []
         self.trajectory: list[dict[str, Any]] = [
             {
@@ -293,7 +329,8 @@ class LocalSimulator:
                         event.get("outcome") == "success" for event in clear_events
                     ),
                     "clear_failure_count": sum(
-                        event.get("outcome") == "failure" for event in clear_events
+                        event.get("outcome") == "no_target_in_range"
+                        for event in clear_events
                     ),
                     "first_signal_sequence": (
                         signal_events[0]["sequence"] if signal_events else None
@@ -379,50 +416,166 @@ class LocalSimulator:
                 stream.write(json.dumps(final_record, ensure_ascii=False) + "\n")
             self.event_log_finalized = True
 
-    def _validate_common(self, payload: dict[str, Any]) -> None:
-        if payload.get("arena_id") != "default":
-            raise LocalSimulatorError("arena_id must be 'default'")
-        robot_id = payload.get("robot_id")
-        request_id = payload.get("request_id")
-        if not isinstance(robot_id, str) or not robot_id:
-            raise LocalSimulatorError("robot_id must be a non-empty string")
-        if not isinstance(request_id, str) or not request_id:
-            raise LocalSimulatorError("request_id must be a non-empty string")
-        if request_id in self.seen_request_ids:
-            raise LocalSimulatorError("request_id must be unique")
-        self.seen_request_ids.add(request_id)
+    @staticmethod
+    def _real_timestamp_ms() -> int:
+        return time.time_ns() // 1_000_000
+
+    def _public_virtual_time(self) -> float:
+        return round(self.statistics.virtual_time_s, 6)
+
+    def _response(self, **fields: Any) -> dict[str, Any]:
+        return {
+            "accepted": True,
+            "real_timestamp_ms": self._real_timestamp_ms(),
+            "virtual_time_s": self._public_virtual_time(),
+            **fields,
+        }
+
+    @staticmethod
+    def rejected_response() -> dict[str, Any]:
+        """Return the three-field rejected response required by Attachment 2."""
+        return {
+            "accepted": False,
+            "real_timestamp_ms": LocalSimulator._real_timestamp_ms(),
+            "virtual_time_s": 0,
+        }
+
+    @staticmethod
+    def _validate_identifier(value: Any, field: str, maximum_bytes: int) -> str:
+        if not isinstance(value, str) or not value:
+            raise ProtocolValidationError(f"{field} must be a non-empty string")
+        if len(value.encode("utf-8")) > maximum_bytes:
+            raise ProtocolValidationError(f"{field} is too long")
+        if any(unicodedata.category(character) in {"Cc", "Cf"} for character in value):
+            raise ProtocolValidationError(
+                f"{field} must not contain control or formatting characters"
+            )
+        return value
+
+    @staticmethod
+    def _request_fingerprint(action: str, payload: dict[str, Any]) -> str:
+        canonical = json.dumps(
+            {"action": action, "payload": payload},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def _prepare_request(
+        self,
+        action: str,
+        payload: dict[str, Any],
+        allowed_fields: frozenset[str],
+    ) -> tuple[str, dict[str, Any] | None]:
+        """Validate a request and return its fingerprint or cached response."""
+        required_fields = {"arena_id", "robot_id", "request_id"}
+        if action in {"measure", "clear"}:
+            required_fields.update({"position", "channel"})
+        missing = required_fields - payload.keys()
+        if missing:
+            raise ProtocolValidationError(
+                "missing required field(s): " + ", ".join(sorted(missing))
+            )
+        unknown = payload.keys() - allowed_fields
+        if unknown:
+            raise BusinessRuleError("unknown field(s): " + ", ".join(sorted(unknown)))
+
+        robot_id = self._validate_identifier(payload["robot_id"], "robot_id", 64)
+        request_id = self._validate_identifier(payload["request_id"], "request_id", 128)
+        fingerprint = self._request_fingerprint(action, payload)
+        previous = self.request_records.get(request_id)
+        if previous is not None:
+            previous_action, previous_fingerprint, previous_response = previous
+            if previous_action != action or previous_fingerprint != fingerprint:
+                raise RequestConflictError(
+                    "request_id was already used with different request content"
+                )
+            return fingerprint, dict(previous_response)
+
+        if payload["arena_id"] != "default":
+            raise BusinessRuleError("arena_id must be 'default'")
         if self.robot_id is not None and robot_id != self.robot_id:
-            raise LocalSimulatorError("robot_id changed during the test")
+            raise BusinessRuleError("robot_id does not match the active test")
+        return fingerprint, None
+
+    def _remember_response(
+        self,
+        action: str,
+        payload: dict[str, Any],
+        fingerprint: str,
+        response: dict[str, Any],
+    ) -> None:
+        self.request_records[str(payload["request_id"])] = (
+            action,
+            fingerprint,
+            dict(response),
+        )
 
     def _require_active(self) -> None:
         if not self.entered:
-            raise LocalSimulatorError("robot has not entered")
+            raise BusinessRuleError("robot has not entered")
         if self.exited:
-            raise LocalSimulatorError("test has already exited")
+            raise BusinessRuleError("test has already exited")
+        if self.statistics.virtual_time_s >= MAX_VIRTUAL_DURATION_S:
+            self.exited = True
+            raise BusinessRuleError("maximum virtual duration has elapsed")
+        if (
+            self.entered_monotonic_s is not None
+            and time.monotonic() - self.entered_monotonic_s >= MAX_REAL_DURATION_S
+        ):
+            self.exited = True
+            raise BusinessRuleError("maximum real duration has elapsed")
 
     @staticmethod
     def _parse_position(payload: dict[str, Any]) -> np.ndarray:
         position = payload.get("position")
         if not isinstance(position, dict):
-            raise LocalSimulatorError("position must be an object")
-        try:
-            parsed = np.array([float(position["x"]), float(position["y"])])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise LocalSimulatorError("position requires numeric x and y") from exc
+            raise ProtocolValidationError("position must be an object")
+        missing = {"x", "y"} - position.keys()
+        if missing:
+            raise ProtocolValidationError(
+                "position is missing field(s): " + ", ".join(sorted(missing))
+            )
+        unknown = position.keys() - {"x", "y"}
+        if unknown:
+            raise BusinessRuleError(
+                "position contains unknown field(s): " + ", ".join(sorted(unknown))
+            )
+        x = position["x"]
+        y = position["y"]
+        if (
+            isinstance(x, bool)
+            or isinstance(y, bool)
+            or not isinstance(x, (int, float))
+            or not isinstance(y, (int, float))
+        ):
+            raise ProtocolValidationError("position.x and position.y must be numbers")
+        parsed = np.array([float(x), float(y)])
         if not bool(np.all(np.isfinite(parsed))):
-            raise LocalSimulatorError("position must be finite")
+            raise ProtocolValidationError("position must be finite")
+        if bool(np.any(np.abs(parsed) > MAX_COORDINATE_ABS)):
+            raise ProtocolValidationError(
+                "each position component must have absolute value at most 2000000"
+            )
         return parsed
 
     @staticmethod
     def _parse_channel(payload: dict[str, Any]) -> int:
         channel = payload.get("channel")
-        if isinstance(channel, bool) or not isinstance(channel, int):
-            raise LocalSimulatorError("channel must be an integer")
-        if channel not in CHANNELS:
-            raise LocalSimulatorError("channel must be between 1 and 20")
-        return channel
+        if (
+            isinstance(channel, bool)
+            or not isinstance(channel, (int, float))
+            or not math.isfinite(float(channel))
+            or not float(channel).is_integer()
+        ):
+            raise ProtocolValidationError("channel must be an integer")
+        parsed = int(channel)
+        if parsed not in CHANNELS:
+            raise ProtocolValidationError("channel must be between 1 and 20")
+        return parsed
 
-    def _move_and_switch(self, position: np.ndarray, channel: int) -> dict[str, Any]:
+    def _move(self, position: np.ndarray, channel: int | None = None) -> dict[str, Any]:
         virtual_time_before = self.statistics.virtual_time_s
         start_position = self.robot_position.copy()
         previous_channel = self.current_channel
@@ -431,22 +584,21 @@ class LocalSimulator:
         self.statistics.movement_distance += distance
         self.statistics.movement_time_s += movement_time
         self.statistics.virtual_time_s += movement_time
-        channel_switched = (
-            self.current_channel is not None and channel != self.current_channel
-        )
-        if self.current_channel is not None and channel != self.current_channel:
+        channel_switched = channel is not None and channel != self.current_channel
+        if channel_switched:
             self.statistics.channel_switch_count += 1
             self.statistics.channel_switch_time_s += CHANNEL_SWITCH_DURATION
             self.statistics.virtual_time_s += CHANNEL_SWITCH_DURATION
         self.robot_position = position
-        self.current_channel = channel
+        if channel is not None:
+            self.current_channel = channel
         return {
             "start_position": self._position_dict(start_position),
             "end_position": self._position_dict(position),
             "distance_m": distance,
             "movement_duration_s": movement_time,
             "previous_channel": previous_channel,
-            "new_channel": channel,
+            "new_channel": self.current_channel,
             "channel_switched": channel_switched,
             "channel_switch_duration_s": (
                 CHANNEL_SWITCH_DURATION if channel_switched else 0.0
@@ -496,16 +648,24 @@ class LocalSimulator:
     def enter(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Enter a freshly generated local test case."""
         with self.lock:
-            self._validate_common(payload)
+            fingerprint, cached = self._prepare_request(
+                "enter",
+                payload,
+                frozenset({"arena_id", "robot_id", "request_id"}),
+            )
+            if cached is not None:
+                return cached
             if self.entered:
-                raise LocalSimulatorError("robot has already entered")
+                raise BusinessRuleError("robot has already entered")
             self.entered = True
             self.robot_id = str(payload["robot_id"])
-            result = {
-                "accepted": True,
-                "remaining_real_duration_s": 1500.0,
-                "virtual_time_s": self.statistics.virtual_time_s,
-            }
+            self.entered_monotonic_s = time.monotonic()
+            result = self._response(
+                max_virtual_duration_s=int(MAX_VIRTUAL_DURATION_S),
+                max_real_duration_s=MAX_REAL_DURATION_S,
+                remaining_real_duration_s=MAX_REAL_DURATION_S,
+            )
+            self._remember_response("enter", payload, fingerprint, result)
             self._append_event_unlocked(
                 {
                     "action": "enter",
@@ -525,20 +685,25 @@ class LocalSimulator:
     def measure(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Measure one channel from the requested robot position."""
         with self.lock:
-            self._validate_common(payload)
-            self._require_active()
+            fingerprint, cached = self._prepare_request(
+                "measure",
+                payload,
+                frozenset(
+                    {"arena_id", "robot_id", "request_id", "position", "channel"}
+                ),
+            )
+            if cached is not None:
+                return cached
             position = self._parse_position(payload)
             channel = self._parse_channel(payload)
-            movement = self._move_and_switch(position, channel)
+            self._require_active()
+            movement = self._move(position, channel)
             self.statistics.measure_count += 1
             self.statistics.measurement_time_s += MEASURE_DURATION
             self.statistics.virtual_time_s += MEASURE_DURATION
 
             jammer = self.jammer_by_channel.get(channel)
-            result: dict[str, Any] = {
-                "accepted": True,
-                "virtual_time_s": self.statistics.virtual_time_s,
-            }
+            result = self._response()
             if (
                 jammer is None
                 or jammer.cleared
@@ -556,8 +721,13 @@ class LocalSimulator:
                     )
                     result["measure_result"] = "direction"
                     result["svd_deg"] = (
-                        true_bearing + self._bearing_error_deg(position, channel)
-                    ) % 360.0
+                        round(
+                            (true_bearing + self._bearing_error_deg(position, channel))
+                            % 360.0,
+                            2,
+                        )
+                        % 360.0
+                    )
 
             truth = self._jammer_truth(jammer, position)
             if result["measure_result"] == "direction":
@@ -565,6 +735,7 @@ class LocalSimulator:
                 truth["bearing_error_deg"] = (
                     (result["svd_deg"] - truth["true_bearing_deg"] + 180.0) % 360.0
                 ) - 180.0
+            self._remember_response("measure", payload, fingerprint, result)
             self._append_event_unlocked(
                 {
                     "action": "measure",
@@ -586,11 +757,19 @@ class LocalSimulator:
     def clear(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Attempt to clear the selected channel within the 20 m radius."""
         with self.lock:
-            self._validate_common(payload)
-            self._require_active()
+            fingerprint, cached = self._prepare_request(
+                "clear",
+                payload,
+                frozenset(
+                    {"arena_id", "robot_id", "request_id", "position", "channel"}
+                ),
+            )
+            if cached is not None:
+                return cached
             position = self._parse_position(payload)
             channel = self._parse_channel(payload)
-            movement = self._move_and_switch(position, channel)
+            self._require_active()
+            movement = self._move(position)
             jammer = self.jammer_by_channel.get(channel)
             cleared_before = jammer.cleared if jammer else False
             success = (
@@ -600,7 +779,8 @@ class LocalSimulator:
                 <= CLEAR_RADIUS + FLOAT_TOLERANCE
             )
             if success:
-                jammer.cleared = True
+                target = cast("Jammer", jammer)
+                target.cleared = True
                 self.statistics.clear_success_count += 1
                 self.statistics.clear_time_s += CLEAR_SUCCESS_DURATION
                 self.statistics.virtual_time_s += CLEAR_SUCCESS_DURATION
@@ -609,18 +789,15 @@ class LocalSimulator:
                 self.statistics.clear_failure_count += 1
                 self.statistics.clear_time_s += CLEAR_FAILURE_DURATION
                 self.statistics.virtual_time_s += CLEAR_FAILURE_DURATION
-                clear_result = "failure"
-            result = {
-                "accepted": True,
-                "clear_result": clear_result,
-                "virtual_time_s": self.statistics.virtual_time_s,
-            }
+                clear_result = "no_target_in_range"
+            result = self._response(clear_result=clear_result)
             truth = self._jammer_truth(jammer, position)
             truth["cleared_before"] = cleared_before
             truth["cleared_after"] = jammer.cleared if jammer else False
             operation_duration = (
                 CLEAR_SUCCESS_DURATION if success else CLEAR_FAILURE_DURATION
             )
+            self._remember_response("clear", payload, fingerprint, result)
             self._append_event_unlocked(
                 {
                     "action": "clear",
@@ -642,16 +819,17 @@ class LocalSimulator:
     def exit(self, payload: dict[str, Any]) -> dict[str, Any]:
         """End the local test and preserve its ground-truth summary."""
         with self.lock:
-            self._validate_common(payload)
+            fingerprint, cached = self._prepare_request(
+                "exit",
+                payload,
+                frozenset({"arena_id", "robot_id", "request_id"}),
+            )
+            if cached is not None:
+                return cached
             self._require_active()
             self.exited = True
-            result = {
-                "accepted": True,
-                "exit_reason": "user_exit",
-                "virtual_time_s": self.statistics.virtual_time_s,
-                "cleared_count": self.cleared_count,
-                "jammer_count": len(self.jammers),
-            }
+            result = self._response(exit_reason="user_exit")
+            self._remember_response("exit", payload, fingerprint, result)
             self._append_event_unlocked(
                 {
                     "action": "exit",
@@ -686,7 +864,6 @@ class LocalSimulatorServer(ThreadingHTTPServer):
 class LocalRequestHandler(BaseHTTPRequestHandler):
     """Serve the official-style JSON API and local read-only diagnostics."""
 
-    server: LocalSimulatorServer
     routes: ClassVar = {
         "/enter": "enter",
         "/measure": "measure",
@@ -694,7 +871,11 @@ class LocalRequestHandler(BaseHTTPRequestHandler):
         "/exit": "exit",
     }
 
-    def log_message(self, format_: str, *args: object) -> None:
+    @property
+    def local_server(self) -> LocalSimulatorServer:
+        return cast("LocalSimulatorServer", self.server)
+
+    def log_message(self, format: str, *args: object) -> None:
         """Suppress default access logging; the client already logs commands."""
 
     def _write_json(self, status: int, payload: dict[str, Any]) -> None:
@@ -705,59 +886,188 @@ class LocalRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(encoded)
 
+    @staticmethod
+    def _pairs_without_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ProtocolValidationError(f"duplicate JSON key: {key}")
+            result[key] = value
+        return result
+
+    @staticmethod
+    def _json_nesting(value: Any) -> int:
+        if isinstance(value, dict):
+            return 1 + max(
+                (LocalRequestHandler._json_nesting(item) for item in value.values()),
+                default=0,
+            )
+        if isinstance(value, list):
+            return 1 + max(
+                (LocalRequestHandler._json_nesting(item) for item in value),
+                default=0,
+            )
+        return 0
+
     def _read_json_object(self) -> dict[str, Any]:
-        length = int(self.headers.get("Content-Length", "0"))
-        payload = json.loads(self.rfile.read(length).decode())
+        content_type = self.headers.get("Content-Type", "")
+        content_type_parts = [part.strip() for part in content_type.split(";")]
+        media_type_ok = bool(content_type_parts) and (
+            content_type_parts[0].lower() == "application/json"
+        )
+        charset_ok = len(content_type_parts) == 1 or (
+            len(content_type_parts) == 2
+            and "=" in content_type_parts[1]
+            and content_type_parts[1].split("=", 1)[0].strip().lower() == "charset"
+            and content_type_parts[1].split("=", 1)[1].strip().strip('"').lower()
+            == "utf-8"
+        )
+        if not media_type_ok or not charset_ok:
+            raise UnsupportedMediaTypeError("unsupported Content-Type")
+        content_encoding = self.headers.get("Content-Encoding")
+        if (
+            content_encoding is not None
+            and content_encoding.strip().lower() != "identity"
+        ):
+            raise UnsupportedMediaTypeError("unsupported Content-Encoding")
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError as exc:
+            raise ProtocolValidationError("invalid Content-Length") from exc
+        if length < 0:
+            raise ProtocolValidationError("invalid Content-Length")
+        if length > MAX_REQUEST_BYTES:
+            raise PayloadTooLargeError("request body exceeds 65536 bytes")
+
+        def reject_constant(value: str) -> None:
+            raise ProtocolValidationError(f"invalid JSON number: {value}")
+
+        payload = json.loads(
+            self.rfile.read(length).decode("utf-8"),
+            object_pairs_hook=self._pairs_without_duplicates,
+            parse_constant=reject_constant,
+        )
         if not isinstance(payload, dict):
-            raise LocalSimulatorError("JSON body must be an object")
+            raise ProtocolValidationError("JSON body must be an object")
+        if self._json_nesting(payload) > MAX_JSON_NESTING:
+            raise ProtocolValidationError("JSON nesting exceeds 16 levels")
         return payload
+
+    def _write_rejection(self, status: int) -> None:
+        self._write_json(status, self.local_server.simulator.rejected_response())
+
+    def _method_not_allowed(self) -> None:
+        if self.path in self.routes:
+            self.send_response(405)
+            self.send_header("Allow", "POST")
+            payload = json.dumps(
+                self.local_server.simulator.rejected_response(), ensure_ascii=False
+            ).encode()
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+        else:
+            self._write_rejection(404)
 
     def do_GET(self) -> None:
         """Expose local-only health and ground-truth inspection endpoints."""
         if self.path == "/health":
             self._write_json(200, {"ok": True, "local_test": True})
         elif self.path == "/state":
-            self._write_json(200, self.server.simulator.public_state())
+            self._write_json(200, self.local_server.simulator.public_state())
+        elif self.path in self.routes:
+            self._method_not_allowed()
         else:
-            self._write_json(404, {"accepted": False, "error": "unknown path"})
+            self._write_rejection(404)
+
+    do_DELETE = _method_not_allowed
+    do_HEAD = _method_not_allowed
+    do_OPTIONS = _method_not_allowed
+    do_PATCH = _method_not_allowed
+    do_PUT = _method_not_allowed
 
     def do_POST(self) -> None:
         """Dispatch one official-style robot request."""
         method_name = self.routes.get(self.path)
         if method_name is None:
             error = "unknown path"
-            self.server.simulator.record_rejected_request(
+            self.local_server.simulator.record_rejected_request(
                 self.path.lstrip("/") or "unknown",
                 None,
                 error,
                 404,
             )
-            self._write_json(404, {"accepted": False, "error": error})
+            self._write_rejection(404)
             return
         payload: dict[str, Any] | None = None
         try:
             payload = self._read_json_object()
-            method = getattr(self.server.simulator, method_name)
+            method = getattr(self.local_server.simulator, method_name)
             result = method(payload)
-        except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+        except PayloadTooLargeError as exc:
             error = str(exc)
-            self.server.simulator.record_rejected_request(
+            self.local_server.simulator.record_rejected_request(
+                method_name,
+                payload,
+                error,
+                413,
+            )
+            self._write_rejection(413)
+            return
+        except UnsupportedMediaTypeError as exc:
+            error = str(exc)
+            self.local_server.simulator.record_rejected_request(
+                method_name,
+                payload,
+                error,
+                415,
+            )
+            self._write_rejection(415)
+            return
+        except RequestConflictError as exc:
+            error = str(exc)
+            self.local_server.simulator.record_rejected_request(
+                method_name,
+                payload,
+                error,
+                409,
+            )
+            self._write_rejection(409)
+            return
+        except (
+            json.JSONDecodeError,
+            UnicodeDecodeError,
+            ProtocolValidationError,
+        ) as exc:
+            error = str(exc)
+            self.local_server.simulator.record_rejected_request(
                 method_name,
                 payload,
                 error,
                 400,
             )
-            self._write_json(400, {"accepted": False, "error": error})
+            self._write_rejection(400)
             return
-        except LocalSimulatorError as exc:
+        except (BusinessRuleError, LocalSimulatorError) as exc:
             error = str(exc)
-            self.server.simulator.record_rejected_request(
+            self.local_server.simulator.record_rejected_request(
                 method_name,
                 payload,
                 error,
                 200,
             )
-            self._write_json(200, {"accepted": False, "error": error})
+            self._write_rejection(200)
+            return
+        except Exception as exc:
+            error = str(exc)
+            self.local_server.simulator.record_rejected_request(
+                method_name,
+                payload,
+                error,
+                500,
+            )
+            self._write_rejection(500)
             return
         self._write_json(200, result)
 
