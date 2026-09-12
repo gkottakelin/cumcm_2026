@@ -29,12 +29,18 @@ from geometry import (
     regular_polygon_vertices,
     smallest_enclosing_circle,
 )
-from localization import intersect_with_sector
+from localization import intersect_with_sector, worst_case_diameter_after_second
 
 ARENA_RADIUS = 1800.0
 MAX_RECEIVE_RADIUS = 1500.0
+MIN_RECEIVE_RADIUS = 1000.0
 CLEAR_RADIUS = 20.0
 SAFE_CLEAR_RADIUS = 18.0
+VIEWPOINT_MOVE_WEIGHT = 1.0
+VIEWPOINT_RING_FACTORS = (0.5, 0.75, 1.0, 1.3)
+VIEWPOINT_ANGLES = 16
+DIRECTIONAL_BACKPLANE_RISK = 600.0
+MEASURE_PLUS_SWITCH_SECONDS = 6.0
 CHANNELS = range(1, 21)
 PROBLEM3 = 3
 PROBLEM4 = 4
@@ -193,6 +199,11 @@ class ChannelState:
     observations: list[tuple[np.ndarray, float]] = field(default_factory=list)
     cleared: bool = False
     attempts: int = 0
+    region: np.ndarray | None = None
+    region_center: np.ndarray | None = None
+    region_radius: float | None = None
+    pending_clear: bool = False
+    tried_viewpoints: list[np.ndarray] = field(default_factory=list)
 
 
 def _inside_arena(point: np.ndarray, margin: float = 2.0) -> np.ndarray:
@@ -263,6 +274,7 @@ class PracticeRunner:
             self.states[channel].observations.append(
                 (position.copy(), math.radians(bearing_deg))
             )
+            self._refresh_region(channel)
             detail = f"direction {bearing_deg:.2f} deg"
         else:
             detail = outcome
@@ -271,6 +283,8 @@ class PracticeRunner:
             f"-> {detail}; t={virtual_time}s",
             flush=True,
         )
+        if outcome == "no_signal":
+            self._apply_no_signal(channel, position)
         if outcome == "near":
             self._clear(position, channel)
         return outcome
@@ -318,43 +332,136 @@ class PracticeRunner:
             points.extend(row)
         return points
 
-    def scan_coverage_points(self) -> None:
-        points = self._coverage_points()
-        for point_index, point in enumerate(points, start=1):
-            print(
-                f"\n[coverage {point_index}/{len(points)}] {_format_position(point)}",
-                flush=True,
-            )
-            for channel in CHANNELS:
-                if not self.states[channel].cleared:
-                    self._measure(point, channel)
-
-    def _region_summary(
-        self, channel: int
-    ) -> tuple[np.ndarray | None, float | None]:
-        observations = self.states[channel].observations
-        if not observations:
-            return None, None
-        region = belief_region(observations)
+    def _refresh_region(self, channel: int) -> None:
+        """Recompute the cached belief region from all stored observations."""
+        state = self.states[channel]
+        if not state.observations:
+            return
+        region = belief_region(state.observations)
         if len(region) == 0:
             print(f"WARNING ch={channel:02d}: bearing intersection is empty")
-            return None, None
+            state.region = region
+            state.region_center = None
+            state.region_radius = None
+            return
         center, radius = smallest_enclosing_circle(region)
-        print(
-            f"LOCATE  ch={channel:02d}: {len(observations)} bearings, "
-            f"center={_format_position(center)}, uncertainty={radius:.2f}m",
-            flush=True,
-        )
+        state.region = region
+        state.region_center = center
+        state.region_radius = radius
+
+    def _region_status(
+        self, channel: int
+    ) -> tuple[np.ndarray | None, float | None]:
+        state = self.states[channel]
+        if not state.observations:
+            return None, None
+        if state.region is None:
+            self._refresh_region(channel)
+        center, radius = state.region_center, state.region_radius
+        if center is not None and radius is not None:
+            print(
+                f"LOCATE  ch={channel:02d}: {len(state.observations)} bearings, "
+                f"center={_format_position(center)}, uncertainty={radius:.2f}m",
+                flush=True,
+            )
         return center, radius
 
-    def refine_and_clear(self, channel: int) -> bool:  # noqa: C901, PLR0912
+    def _apply_no_signal(self, channel: int, position: np.ndarray) -> None:
+        """Problem 3 only: a detected omnidirectional source must be > 1000 m away."""
+        if self.problem != PROBLEM3:
+            return
+        state = self.states[channel]
+        if not state.observations or state.region is None or len(state.region) == 0:
+            return
+        updated = self._exclude_reception_disk(state.region, position)
+        if len(updated) == 0:
+            print(
+                f"WARNING ch={channel:02d}: no-signal exclusion emptied the "
+                "region; keeping previous region"
+            )
+            return
+        state.region = updated
+        center, radius = smallest_enclosing_circle(updated)
+        state.region_center = center
+        state.region_radius = radius
+
+    def _exclude_reception_disk(
+        self,
+        polygon: np.ndarray,
+        center: np.ndarray,
+        radius: float = MIN_RECEIVE_RADIUS,
+        sides: int = 64,
+    ) -> np.ndarray:
+        """Remove the reception disk around `center` from a convex polygon.
+
+        Tangent halfplanes sit on a ring whose circumscribed polygon has
+        circumradius exactly `radius`, so only points strictly inside the disk
+        are removed and the true source position cannot be excluded.
+        """
+        if len(polygon) == 0:
+            return polygon
+        ring_radius = radius * math.cos(math.pi / sides)
+        result = polygon
+        for k in range(sides):
+            angle = 2.0 * math.pi * k / sides
+            outward = np.array([math.cos(angle), math.sin(angle)])
+            point = center + ring_radius * outward
+            result = clip_convex_polygon_by_halfplane(result, point, outward)
+            if len(result) == 0:
+                break
+        return result
+
+    def _schedule_clears(self, route: list[tuple]) -> None:
+        """Insert clear stops for every channel whose region is safe to clear."""
+        for channel in CHANNELS:
+            state = self.states[channel]
+            if state.cleared or state.pending_clear or not state.observations:
+                continue
+            if state.region is None:
+                self._refresh_region(channel)
+            if state.region_center is None or state.region_radius is None:
+                continue
+            if state.region_radius <= SAFE_CLEAR_RADIUS:
+                stop = ("clear", state.region_center.copy(), channel)
+                self._insert_stop(route, stop)
+                state.pending_clear = True
+                print(
+                    f"SCHEDULE ch={channel:02d} clear at "
+                    f"{_format_position(state.region_center)} "
+                    f"(uncertainty {state.region_radius:.1f}m)",
+                    flush=True,
+                )
+
+    def _insert_stop(self, route: list[tuple], stop: tuple) -> None:
+        """Insert a stop where the time detour minus saved scans is smallest."""
+        point = stop[1]
+        best_index = len(route)
+        best_cost = None
+        for index in range(len(route) + 1):
+            previous = self.current_position if index == 0 else route[index - 1][1]
+            if index < len(route):
+                following = route[index][1]
+                detour = (
+                    float(np.linalg.norm(previous - point))
+                    + float(np.linalg.norm(point - following))
+                    - float(np.linalg.norm(previous - following))
+                )
+            else:
+                detour = float(np.linalg.norm(previous - point))
+            remaining_scans = sum(1 for item in route[index:] if item[0] == "scan")
+            cost = detour / 5.0 - MEASURE_PLUS_SWITCH_SECONDS * remaining_scans
+            if best_cost is None or cost < best_cost - 1e-9:
+                best_cost = cost
+                best_index = index
+        route.insert(best_index, stop)
+
+    def refine_and_clear(self, channel: int) -> bool:
         state = self.states[channel]
         if state.cleared or not state.observations:
             return state.cleared
 
-        # Existing coverage bearings are often already enough to clear safely.
-        for step in range(10):
-            center, radius = self._region_summary(channel)
+        for _step in range(10):
+            center, radius = self._region_status(channel)
             if (
                 center is not None
                 and radius is not None
@@ -363,63 +470,166 @@ class PracticeRunner:
             ):
                 return True
 
-            if step == 0 and len(state.observations) == 1:
-                first_position, first_bearing = state.observations[0]
-                forward = direction_vector(first_bearing)
-                left = np.array([-forward[1], forward[0]])
-                if self.problem == PROBLEM4:
-                    # Move toward the source to remain in range.  Trying both
-                    # lateral signs guarantees that at least one stays in the
-                    # emitting half-plane when the first point is on its edge.
-                    targets = (
-                        first_position + 500.0 * forward + 350.0 * left,
-                        first_position + 500.0 * forward - 350.0 * left,
-                    )
-                else:
-                    targets = (
-                        first_position + 750.0 * forward + 500.0 * left,
-                        first_position + 750.0 * forward - 500.0 * left,
-                    )
-                target = targets[0]
-            elif step == 1 and len(state.observations) <= 2:  # noqa: PLR2004
-                first_position, first_bearing = state.observations[0]
-                forward = direction_vector(first_bearing)
-                left = np.array([-forward[1], forward[0]])
-                if self.problem == PROBLEM4:
-                    target = first_position + 500.0 * forward - 350.0 * left
-                else:
-                    target = first_position + 750.0 * forward - 500.0 * left
-            elif center is not None:
-                # Surround the current estimate with well-separated viewpoints.
-                view_radius = 450.0 if radius is None else max(250.0, 850.0 - radius)
-                view_radius = min(view_radius, 650.0)
-                target = center + view_radius * direction_vector(step * math.pi / 2)
-            else:
-                first_position, first_bearing = state.observations[0]
-                target = first_position + (500.0 + 50.0 * step) * direction_vector(
-                    first_bearing
-                )
-
-            outcome = self._measure(_inside_arena(target), channel)
+            target = self._choose_viewpoint(channel)
+            if target is None:
+                break
+            outcome = self._measure(target, channel)
             if state.cleared:
                 return True
             if outcome not in {"direction", "near"}:
                 print(f"REFINE  ch={channel:02d}: no bearing at this viewpoint")
 
-        center, radius = self._region_summary(channel)
+        center, radius = self._region_status(channel)
         if center is not None and radius is not None and radius <= CLEAR_RADIUS:
             return self._clear(center, channel)
         return False
 
+    def _choose_viewpoint(self, channel: int) -> np.ndarray | None:
+        """Pick the next measurement point by minimax shrink plus travel cost."""
+        state = self.states[channel]
+        if state.region is None or len(state.region) < 3:
+            if state.observations:
+                position, bearing = state.observations[-1]
+                fallback = position + 600.0 * direction_vector(bearing)
+                return _inside_arena(fallback) if self.problem == PROBLEM3 else fallback
+            return None
+        center = state.region_center
+        distance = float(np.linalg.norm(self.current_position - center))
+        base = min(max(0.6 * distance, 250.0), 800.0)
+        ring_candidates: list[np.ndarray] = [self.current_position.copy()]
+        for factor in VIEWPOINT_RING_FACTORS:
+            ring = base * factor
+            for k in range(VIEWPOINT_ANGLES):
+                angle = 2.0 * math.pi * k / VIEWPOINT_ANGLES
+                candidate = center + ring * direction_vector(angle)
+                if self.problem == PROBLEM3:
+                    candidate = _inside_arena(candidate)
+                ring_candidates.append(candidate)
+        # Approach candidates move from a proven observation point toward the
+        # estimated source.  Staying near the observation-to-source line keeps
+        # the robot inside a directional source's emitting half-plane and well
+        # within reception range, so these are strongly preferred for Problem 4.
+        approach_candidates: list[np.ndarray] = []
+        for observed_position, _ in state.observations[-3:]:
+            for fraction in (0.35, 0.55, 0.75):
+                candidate = observed_position + fraction * (
+                    center - observed_position
+                )
+                if self.problem == PROBLEM3:
+                    candidate = _inside_arena(candidate)
+                approach_candidates.append(candidate)
+        scored: list[tuple[np.ndarray, bool]] = [
+            *[(candidate, False) for candidate in ring_candidates],
+            *[(candidate, True) for candidate in approach_candidates],
+        ]
+        best: np.ndarray | None = None
+        best_score = float("inf")
+        for candidate, is_approach in scored:
+            if any(
+                float(np.linalg.norm(candidate - tried)) <= 50.0
+                for tried in state.tried_viewpoints
+            ):
+                continue
+            if any(
+                float(np.linalg.norm(candidate - observed)) <= 50.0
+                for observed, _ in state.observations
+            ):
+                continue
+            if is_approach:
+                reception_penalty = 0.0
+            else:
+                worst_receive = max(
+                    float(np.linalg.norm(candidate - vertex)) for vertex in state.region
+                )
+                if worst_receive > 1150.0:
+                    continue
+                reception_penalty = 0.5 * max(
+                    0.0, worst_receive - MIN_RECEIVE_RADIUS
+                )
+            move_time = float(np.linalg.norm(candidate - self.current_position)) / 5.0
+            predicted = worst_case_diameter_after_second(state.region, candidate)
+            score = (
+                predicted
+                + VIEWPOINT_MOVE_WEIGHT * move_time
+                + reception_penalty
+            )
+            if self.problem == PROBLEM4 and not is_approach:
+                score += DIRECTIONAL_BACKPLANE_RISK
+            if score < best_score:
+                best = candidate
+                best_score = score
+        if best is None:
+            return None
+        state.tried_viewpoints.append(best.copy())
+        return best
+
+    def _refinement_order(self, detected: list[int]) -> list[int]:
+        """Visit remaining channels nearest-region-center first from the robot."""
+        remaining = [
+            channel
+            for channel in detected
+            if not self.states[channel].cleared and self.states[channel].observations
+        ]
+        order: list[int] = []
+        position = self.current_position.copy()
+        while remaining:
+            best_channel = None
+            best_distance = float("inf")
+            for channel in remaining:
+                center = self.states[channel].region_center
+                if center is None:
+                    continue
+                distance = float(np.linalg.norm(position - center))
+                if distance < best_distance:
+                    best_distance = distance
+                    best_channel = channel
+            if best_channel is None:
+                best_channel = remaining[0]
+            order.append(best_channel)
+            remaining.remove(best_channel)
+            center = self.states[best_channel].region_center
+            if center is not None:
+                position = center
+        return order
+
     def run(self) -> tuple[list[int], list[int]]:
-        self.scan_coverage_points()
+        coverage_points = self._coverage_points()
+        total_points = len(coverage_points)
+        route: list[tuple] = [("scan", point) for point in coverage_points]
+        scan_index = 0
+        while route:
+            stop = route.pop(0)
+            if stop[0] == "scan":
+                scan_index += 1
+                point = stop[1]
+                print(
+                    f"\n[coverage {scan_index}/{total_points}] "
+                    f"{_format_position(point)}",
+                    flush=True,
+                )
+                for channel in CHANNELS:
+                    if not self.states[channel].cleared:
+                        self._measure(point, channel)
+                self._schedule_clears(route)
+            else:
+                _, point, channel = stop
+                state = self.states[channel]
+                state.pending_clear = False
+                if not state.cleared:
+                    print(
+                        f"\n[route-clear ch={channel:02d}] "
+                        f"{_format_position(point)}",
+                        flush=True,
+                    )
+                    self._clear(point, channel)
+
         detected = [
             channel
             for channel, state in self.states.items()
             if state.observations or state.cleared
         ]
         print(f"\nDetected active channels: {detected}", flush=True)
-        for channel in detected:
+        for channel in self._refinement_order(detected):
             if not self.states[channel].cleared:
                 print(f"\n[localize channel {channel}]", flush=True)
                 self.refine_and_clear(channel)
