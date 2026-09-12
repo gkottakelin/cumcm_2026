@@ -53,9 +53,12 @@ MEASURE_PLUS_SWITCH_SECONDS = 6.0
 CHANNELS = range(1, 21)
 PROBLEM3 = 3
 PROBLEM4 = 4
-PROBLEM4_INTERIOR_STEP = 870.0
-PROBLEM4_POLAR_RADIUS = 1850.0
-PROBLEM4_SOURCE_COUNT = 16
+PROBLEM4_INNER_RING_RADIUS = 960.0
+PROBLEM4_OUTER_RING_RADIUS = 1850.0
+# The problem statement bounds the number of sources at 16 (10-16 per case),
+# so detecting 16 distinct channels rules out any residual source for both
+# problems regardless of the random draw.
+SOURCE_COUNT_CAP = 16
 DEFAULT_SIMULATOR_DATA_DIR = (
     Path(__file__).resolve().parents[2]
     / "Jammers-simulator-win64"
@@ -348,33 +351,25 @@ class PracticeRunner:
             )
             return points
 
-        # Certified sparse layout for Problem 4 (tuning report iter-002):
-        # a 5x5 square lattice with 870 m step (extent 1740 m) plus four
-        # polar points at 1850 m.  Every arena position lies inside the
-        # convex hull of scan points within 980 m (verified numerically on
-        # a 5 m sampling grid plus a dense edge annulus), so by the convex
-        # combination argument any 180-degree emission half-plane contains
-        # a scan point within the 1000 m guaranteed reception radius.
-        # Tour order (tuning report iter-005): the inner 3x3 runs first --
-        # its 1000 m disks cover the whole arena, so every omnidirectional
-        # source is found within the first nine stops -- then the outer 20
-        # points as one loop.  With the 16-source early stop only the
-        # detection prefix matters; this order reaches it about 2.5 km
-        # sooner than a plain nearest-neighbour tour.
-        step = PROBLEM4_INTERIOR_STEP
-        coords = (-2.0 * step, -step, 0.0, step, 2.0 * step)
-        points = [np.array([x, y]) for y in coords for x in coords]
-        points.extend(
-            np.array([sx * PROBLEM4_POLAR_RADIUS, 0.0]) for sx in (1.0, -1.0)
-        )
-        points.extend(
-            np.array([0.0, sy * PROBLEM4_POLAR_RADIUS]) for sy in (1.0, -1.0)
-        )
-        def _inner(point: np.ndarray) -> bool:
-            return max(abs(float(point[0])), abs(float(point[1]))) <= step + 1e-9
-
-        inner = [p for p in points if _inner(p)]
-        outer = [p for p in points if not _inner(p)]
+        # Certified 25-point layout for Problem 4 (tuning report iter-008):
+        # one center point, an 8-point inner ring at 960 m (45 deg spacing,
+        # 22.5 deg phase) and a 16-point outer ring at 1850 m (22.5 deg
+        # spacing).  Every arena position lies inside the convex hull of
+        # scan points within 980 m (verified numerically on a 5 m sampling
+        # grid plus a dense edge annulus), so by the convex combination
+        # argument any 180-degree emission half-plane contains a scan point
+        # within the 1000 m guaranteed reception radius; the omnidirectional
+        # worst-case nearest scan point is about 550 m.  Center and inner
+        # ring run first, then the outer ring closes the tour (~17.8 km
+        # versus ~21.3 km for the previous 29-point layout).
+        inner = [np.array([0.0, 0.0])]
+        for k in range(8):
+            angle = math.radians(22.5 + 45.0 * k)
+            inner.append(PROBLEM4_INNER_RING_RADIUS * direction_vector(angle))
+        outer = [
+            PROBLEM4_OUTER_RING_RADIUS * direction_vector(math.radians(22.5 * k))
+            for k in range(16)
+        ]
         tour = _nearest_neighbor_tour(inner)
         return tour + _nearest_neighbor_tour(
             outer, tour[-1] if tour else np.array([0.0, 0.0])
@@ -822,17 +817,14 @@ class PracticeRunner:
                     if not self.states[channel].cleared:
                         self._measure(point, channel)
                 self._schedule_clears(route)
-                if (
-                    self.problem == PROBLEM4
-                    and self._detected_channel_count() >= PROBLEM4_SOURCE_COUNT
-                ):
-                    # The problem fixes the number of Problem 4 sources at 16,
-                    # so detecting 16 distinct channels rules out any residual
+                if self._detected_channel_count() >= SOURCE_COUNT_CAP:
+                    # The problem bounds the source count at 16 (10-16 per
+                    # case), so 16 detected channels rule out any residual
                     # source and the remaining coverage certificate stops
-                    # being necessary (model.md section 6.4).
+                    # being necessary.
                     print(
-                        f"\n[early-stop] all {PROBLEM4_SOURCE_COUNT} sources "
-                        "detected; skipping remaining coverage points",
+                        f"\n[early-stop] all {SOURCE_COUNT_CAP} possible "
+                        "sources detected; skipping remaining coverage points",
                         flush=True,
                     )
                     break
