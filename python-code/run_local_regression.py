@@ -37,10 +37,22 @@ def _run_case(
     client_path: Path,
     *,
     verbose: bool,
+    source_count: int | None = None,
+    directional_count: int | None = None,
 ) -> dict[str, Any]:
-    simulator = LocalSimulator(problem, seed)
+    simulator = LocalSimulator(
+        problem,
+        seed,
+        source_count=source_count,
+        directional_count=directional_count,
+    )
     directional_count = sum(
         jammer.source_type == "directional" for jammer in simulator.jammers
+    )
+    suffix = (
+        f"-n{source_count}" + (f"d{directional_count}" if problem == PROBLEM4 else "")
+        if source_count is not None
+        else ""
     )
 
     with tempfile.TemporaryDirectory(prefix="jammers-local-test-") as temporary:
@@ -80,7 +92,7 @@ def _run_case(
     all_cleared = simulator.cleared_count == len(simulator.jammers)
     passed = completed.returncode == 0 and all_cleared and simulator.exited
     result: dict[str, Any] = {
-        "case_id": f"p{problem}-seed{seed}",
+        "case_id": f"p{problem}-seed{seed}{suffix}",
         "problem": problem,
         "seed": seed,
         "source_count": len(simulator.jammers),
@@ -157,6 +169,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--cases", type=int, default=10)
     parser.add_argument("--seed", type=int, default=2026)
+    parser.add_argument(
+        "--source-count",
+        type=int,
+        help="force the number of sources (10-16) for stratified stress cases",
+    )
+    parser.add_argument(
+        "--directional-count",
+        type=int,
+        help="force the number of directional sources (Problem 4, 1..N-1)",
+    )
     parser.add_argument("--port", type=int, default=DEFAULT_LOCAL_PORT)
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--output", type=Path)
@@ -193,6 +215,8 @@ def main() -> int:
                 args.port,
                 client_path,
                 verbose=args.verbose,
+                source_count=args.source_count,
+                directional_count=args.directional_count,
             )
             results.append(result)
             status = "PASS" if result["passed"] else "FAIL"
