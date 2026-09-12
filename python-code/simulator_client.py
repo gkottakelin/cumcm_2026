@@ -39,13 +39,16 @@ SAFE_CLEAR_RADIUS = 18.0
 VIEWPOINT_MOVE_WEIGHT = 1.0
 VIEWPOINT_RING_FACTORS = (0.5, 0.75, 1.0, 1.3)
 VIEWPOINT_ANGLES = 16
-DIRECTIONAL_BACKPLANE_RISK = 600.0
+DIRECTIONAL_WALK_OFFSETS = (350.0, 700.0, 1050.0)
+DIRECTIONAL_LATERAL_FRACTIONS = (0.35, 0.65)
+DIRECTIONAL_LATERAL_OFFSETS = (250.0, 450.0)
+SAME_SIDE_PENALTY = 800.0
 MEASURE_PLUS_SWITCH_SECONDS = 6.0
 CHANNELS = range(1, 21)
 PROBLEM3 = 3
 PROBLEM4 = 4
-PROBLEM4_GRID_SPACING = 700.0
-ROBOT_SEARCH_RADIUS = 2800.0
+PROBLEM4_INTERIOR_STEP = 870.0
+PROBLEM4_POLAR_RADIUS = 1850.0
 DEFAULT_SIMULATOR_DATA_DIR = (
     Path(__file__).resolve().parents[2]
     / "Jammers-simulator-win64"
@@ -204,6 +207,7 @@ class ChannelState:
     region_radius: float | None = None
     pending_clear: bool = False
     tried_viewpoints: list[np.ndarray] = field(default_factory=list)
+    no_signal_viewpoints: list[np.ndarray] = field(default_factory=list)
 
 
 def _inside_arena(point: np.ndarray, margin: float = 2.0) -> np.ndarray:
@@ -251,6 +255,19 @@ def belief_region(observations: list[tuple[np.ndarray, float]]) -> np.ndarray:
 
 def _format_position(position: np.ndarray) -> str:
     return f"({position[0]:.1f}, {position[1]:.1f})"
+
+
+def _nearest_neighbor_tour(points: list[np.ndarray]) -> list[np.ndarray]:
+    """Order scan points by greedy nearest neighbour starting at the origin."""
+    remaining = list(points)
+    tour: list[np.ndarray] = []
+    current = np.array([0.0, 0.0])
+    while remaining:
+        distances = [float(np.linalg.norm(current - p)) for p in remaining]
+        index = int(np.argmin(distances))
+        current = remaining.pop(index)
+        tour.append(current)
+    return tour
 
 
 class PracticeRunner:
@@ -315,22 +332,24 @@ class PracticeRunner:
             )
             return points
 
-        # A square lattice extending beyond the source arena.  Every possible
-        # source lies in the convex hull of nearby scan points no farther than
-        # 1000 m, so an arbitrary 180-degree emission half-plane contains at
-        # least one of those points.  Rows are snaked to shorten the route.
-        coordinates = np.arange(-2100.0, 2100.1, PROBLEM4_GRID_SPACING)
-        points: list[np.ndarray] = []
-        for row_index, y in enumerate(coordinates):
-            row = [
-                np.array([x, y])
-                for x in coordinates
-                if math.hypot(float(x), float(y)) <= ROBOT_SEARCH_RADIUS
-            ]
-            if row_index % 2:
-                row.reverse()
-            points.extend(row)
-        return points
+        # Certified sparse layout for Problem 4 (tuning report iter-002):
+        # a 5x5 square lattice with 870 m step (extent 1740 m) plus four
+        # polar points at 1850 m.  Every arena position lies inside the
+        # convex hull of scan points within 980 m (verified numerically on
+        # a 5 m sampling grid plus a dense edge annulus), so by the convex
+        # combination argument any 180-degree emission half-plane contains
+        # a scan point within the 1000 m guaranteed reception radius.  A
+        # nearest-neighbour tour from the origin shortens the route.
+        step = PROBLEM4_INTERIOR_STEP
+        coords = (-2.0 * step, -step, 0.0, step, 2.0 * step)
+        points = [np.array([x, y]) for y in coords for x in coords]
+        points.extend(
+            np.array([sx * PROBLEM4_POLAR_RADIUS, 0.0]) for sx in (1.0, -1.0)
+        )
+        points.extend(
+            np.array([0.0, sy * PROBLEM4_POLAR_RADIUS]) for sy in (1.0, -1.0)
+        )
+        return _nearest_neighbor_tour(points)
 
     def _refresh_region(self, channel: int) -> None:
         """Recompute the cached belief region from all stored observations."""
@@ -476,7 +495,8 @@ class PracticeRunner:
             outcome = self._measure(target, channel)
             if state.cleared:
                 return True
-            if outcome not in {"direction", "near"}:
+            if outcome == "no_signal":
+                state.no_signal_viewpoints.append(target.copy())
                 print(f"REFINE  ch={channel:02d}: no bearing at this viewpoint")
 
         center, radius = self._region_status(channel)
@@ -496,20 +516,10 @@ class PracticeRunner:
         center = state.region_center
         distance = float(np.linalg.norm(self.current_position - center))
         base = min(max(0.6 * distance, 250.0), 800.0)
-        ring_candidates: list[np.ndarray] = [self.current_position.copy()]
-        for factor in VIEWPOINT_RING_FACTORS:
-            ring = base * factor
-            for k in range(VIEWPOINT_ANGLES):
-                angle = 2.0 * math.pi * k / VIEWPOINT_ANGLES
-                candidate = center + ring * direction_vector(angle)
-                if self.problem == PROBLEM3:
-                    candidate = _inside_arena(candidate)
-                ring_candidates.append(candidate)
-        # Approach candidates move from a proven observation point toward the
-        # estimated source.  Staying near the observation-to-source line keeps
-        # the robot inside a directional source's emitting half-plane and well
-        # within reception range, so these are strongly preferred for Problem 4.
-        approach_candidates: list[np.ndarray] = []
+        # Safe candidates move from a proven observation point toward the
+        # estimated source: staying near the observation-to-source line keeps
+        # the robot inside a directional source's emitting half-plane.
+        safe_candidates: list[np.ndarray] = []
         for observed_position, _ in state.observations[-3:]:
             for fraction in (0.35, 0.55, 0.75):
                 candidate = observed_position + fraction * (
@@ -517,14 +527,39 @@ class PracticeRunner:
                 )
                 if self.problem == PROBLEM3:
                     candidate = _inside_arena(candidate)
-                approach_candidates.append(candidate)
+                safe_candidates.append(candidate)
+        risky_candidates: list[np.ndarray] = [self.current_position.copy()]
+        if self.problem == PROBLEM3:
+            for factor in VIEWPOINT_RING_FACTORS:
+                ring = base * factor
+                for k in range(VIEWPOINT_ANGLES):
+                    angle = 2.0 * math.pi * k / VIEWPOINT_ANGLES
+                    candidate = center + ring * direction_vector(angle)
+                    risky_candidates.append(_inside_arena(candidate))
+        else:
+            # Problem 4 structured probes: walking the latest bearing line
+            # stays inside the emitting half-plane up to the source, and from
+            # any safe point at least one of the two lateral offsets is
+            # guaranteed receivable (max(x+y, x-y) >= x >= 0).
+            latest_position, latest_bearing = state.observations[-1]
+            forward = direction_vector(latest_bearing)
+            lateral = np.array([-forward[1], forward[0]])
+            for offset in DIRECTIONAL_WALK_OFFSETS:
+                safe_candidates.append(latest_position + offset * forward)
+            for fraction in DIRECTIONAL_LATERAL_FRACTIONS:
+                anchor = latest_position + fraction * (
+                    center - latest_position
+                )
+                for lateral_offset in DIRECTIONAL_LATERAL_OFFSETS:
+                    safe_candidates.append(anchor + lateral_offset * lateral)
+                    safe_candidates.append(anchor - lateral_offset * lateral)
         scored: list[tuple[np.ndarray, bool]] = [
-            *[(candidate, False) for candidate in ring_candidates],
-            *[(candidate, True) for candidate in approach_candidates],
+            *[(candidate, False) for candidate in risky_candidates],
+            *[(candidate, True) for candidate in safe_candidates],
         ]
         best: np.ndarray | None = None
         best_score = float("inf")
-        for candidate, is_approach in scored:
+        for candidate, is_safe in scored:
             if any(
                 float(np.linalg.norm(candidate - tried)) <= 50.0
                 for tried in state.tried_viewpoints
@@ -535,26 +570,24 @@ class PracticeRunner:
                 for observed, _ in state.observations
             ):
                 continue
-            if is_approach:
-                reception_penalty = 0.0
-            else:
+            penalty = 0.0
+            if not is_safe:
                 worst_receive = max(
                     float(np.linalg.norm(candidate - vertex)) for vertex in state.region
                 )
                 if worst_receive > 1150.0:
                     continue
-                reception_penalty = 0.5 * max(
-                    0.0, worst_receive - MIN_RECEIVE_RADIUS
-                )
+                penalty += 0.5 * max(0.0, worst_receive - MIN_RECEIVE_RADIUS)
+            if self.problem == PROBLEM4 and state.no_signal_viewpoints:
+                # A no-signal probe marks its side of the region as likely
+                # back-plane; prefer flipping to the opposite side.
+                for failed in state.no_signal_viewpoints:
+                    if float(np.dot(candidate - center, failed - center)) > 0.0:
+                        penalty += SAME_SIDE_PENALTY
+                        break
             move_time = float(np.linalg.norm(candidate - self.current_position)) / 5.0
             predicted = worst_case_diameter_after_second(state.region, candidate)
-            score = (
-                predicted
-                + VIEWPOINT_MOVE_WEIGHT * move_time
-                + reception_penalty
-            )
-            if self.problem == PROBLEM4 and not is_approach:
-                score += DIRECTIONAL_BACKPLANE_RISK
+            score = predicted + VIEWPOINT_MOVE_WEIGHT * move_time + penalty
             if score < best_score:
                 best = candidate
                 best_score = score
