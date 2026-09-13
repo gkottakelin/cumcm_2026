@@ -13,6 +13,9 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
+import shutil
+import subprocess
 import sys
 import time
 import uuid
@@ -75,6 +78,72 @@ class SimulatorError(RuntimeError):
     """Raised when the simulator cannot accept an API operation."""
 
 
+_PRACTICE_UI_SCRIPT = r"""
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+$process = Get-Process -Name 'jammers-simulator' -ErrorAction Stop |
+    Select-Object -First 1
+if ($process.MainWindowHandle -eq 0) { exit 2 }
+$root = [System.Windows.Automation.AutomationElement]::FromHandle(
+    $process.MainWindowHandle
+)
+$walker = [System.Windows.Automation.TreeWalker]::RawViewWalker
+$queue = [System.Collections.Generic.Queue[
+    System.Windows.Automation.AutomationElement
+]]::new()
+$queue.Enqueue($root)
+$seen = 0
+while ($queue.Count -gt 0 -and $seen -lt 5000) {
+    $node = $queue.Dequeue()
+    $seen++
+    try {
+        $name = $node.Current.Name
+        if ($name -match '^问题[34]\s*演练\s*测试$') {
+            Write-Output $name
+        }
+        $child = $walker.GetFirstChild($node)
+        while ($null -ne $child) {
+            $queue.Enqueue($child)
+            $child = $walker.GetNextSibling($child)
+        }
+    } catch {}
+}
+"""
+
+
+def _practice_problem_from_window() -> int | None:
+    """Read the active practice heading without clicking the simulator UI."""
+    powershell = shutil.which("powershell.exe")
+    if powershell is None:
+        return None
+    try:
+        completed = subprocess.run(  # noqa: S603
+            [
+                powershell,
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                _PRACTICE_UI_SCRIPT,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    problems = {
+        int(match.group(1))
+        for line in completed.stdout.splitlines()
+        if (match := re.fullmatch(r"问题([34])\s*演练\s*测试", line.strip()))
+    }
+    return problems.pop() if len(problems) == 1 else None
+
+
 def require_active_practice(data_dir: Path, expected_problem: int) -> list[Path]:
     """Prove that the simulator's active recovery state is a practice test.
 
@@ -115,6 +184,7 @@ def require_active_practice(data_dir: Path, expected_problem: int) -> list[Path]
                 '"mode":"practice"',
                 '"ticket_type":"practice_ticket_v1"',
                 '"package_type":"practice_behavior_log"',
+                '"event":"practice_authorized"',
             )
         )
         formal_proof |= any(
@@ -123,6 +193,7 @@ def require_active_practice(data_dir: Path, expected_problem: int) -> list[Path]
                 '"mode":"formal"',
                 '"ticket_type":"activation_ticket_v1"',
                 '"package_type":"formal_behavior_log"',
+                '"event":"formal_authorized"',
             )
         )
         formal_proof |= any(
@@ -144,13 +215,22 @@ def require_active_practice(data_dir: Path, expected_problem: int) -> list[Path]
             "practice-test evidence. No API request was sent."
         )
         raise SimulatorError(message)
-    if problem_numbers != {expected_problem}:
+    if problem_numbers and problem_numbers != {expected_problem}:
         message = (
             "PRACTICE GUARD BLOCKED: active problem evidence is "
             f"{sorted(problem_numbers)}, but --problem is {expected_problem}. "
             "No API request was sent."
         )
         raise SimulatorError(message)
+    if not problem_numbers:
+        ui_problem = _practice_problem_from_window()
+        if ui_problem != expected_problem:
+            message = (
+                "PRACTICE GUARD BLOCKED: active journal proves practice mode but "
+                f"the simulator window proves problem {ui_problem!r}, while "
+                f"--problem is {expected_problem}. No API request was sent."
+            )
+            raise SimulatorError(message)
     return files
 
 
