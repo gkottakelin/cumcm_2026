@@ -22,20 +22,20 @@ $$
 
 ## 2 符号说明与基本假设
 
-| 符号 | 含义 |
-|---|---|
-| $\Omega$ | 半径为 1800 m 的目标圆域，$\Omega=\{x\in\mathbb R^2:\|x\|_2\le1800\}$ |
-| $s_i$ | 第 $i$ 个检测点坐标 |
-| $g$ | 某干扰源的真实位置 |
-| $\theta_i$ | 在检测点 $s_i$ 处测得的示向度 |
-| $\delta$ | 示向误差上界，本题 $\delta=1^\circ$ |
-| $W_i$ | 第 $i$ 次测量对应的示向角度区域 |
-| $P_k$ | 前 $k$ 次有效示向测量后的定位可行域 |
-| $D(P)$ | 定位区域 $P$ 的直径 |
-| $R(P)$ | 覆盖 $P$ 的最小圆半径 |
-| $r_j$ | 第 $j$ 个干扰源的有效接收半径，$1000\le r_j\le1500$ |
-| $v$ | 机器狗移动速度，$v=5\text{ m/s}$ |
-| $z_j$ | 频道 $j$ 的信息状态，包括历史测量、定位区域及是否清除 |
+| 符号       | 含义                                                                  |
+| ---------- | --------------------------------------------------------------------- |
+| $\Omega$   | 半径为 1800 m 的目标圆域，$\Omega=\{x\in\mathbb R^2:\|x\|_2\le1800\}$ |
+| $s_i$      | 第 $i$ 个检测点坐标                                                   |
+| $g$        | 某干扰源的真实位置                                                    |
+| $\theta_i$ | 在检测点 $s_i$ 处测得的示向度                                         |
+| $\delta$   | 示向误差上界，本题 $\delta=1^\circ$                                   |
+| $W_i$      | 第 $i$ 次测量对应的示向角度区域                                       |
+| $P_k$      | 前 $k$ 次有效示向测量后的定位可行域                                   |
+| $D(P)$     | 定位区域 $P$ 的直径                                                   |
+| $R(P)$     | 覆盖 $P$ 的最小圆半径                                                 |
+| $r_j$      | 第 $j$ 个干扰源的有效接收半径，$1000\le r_j\le1500$                   |
+| $v$        | 机器狗移动速度，$v=5\text{ m/s}$                                      |
+| $z_j$      | 频道 $j$ 的信息状态，包括历史测量、定位区域及是否清除                 |
 
 建议作如下假设：
 
@@ -597,15 +597,15 @@ $$
 
 ### 7.1 必做参数
 
-| 参数 | 建议取值 | 主要观察指标 | 目的 |
-|---|---:|---|---|
-| 安全清除裕量 $\varepsilon$ | 0、1、2、3、5 m | 清除失败率、平均时间、追加测量次数 | 判断精度与效率的权衡 |
-| 定位与移动权重 $\lambda$ | 0、0.1、0.5、1、2、5 | 最坏定位直径、移动距离、总时间 | 验证第二检测点目标函数稳定性 |
-| 候选点空间网格间距 $h$ | 25、50、100、150 m | 最优目标值、运行时间、未覆盖率 | 判断离散精度是否足够 |
-| 定向角离散步长 $\Delta\phi$ | 2°、5°、10°、15° | 独立密网格未覆盖率、检测点数量 | 防止粗网格漏掉最坏方向 |
-| 距离安全裕量 $\eta_r$ | 0、20、50、100 m | 鲁棒覆盖率、检测点数量、路线长度 | 评价集合覆盖的保守程度 |
-| 交会角下限 $\beta_{\min}$ | 30°、45°、60°、75° | 定位直径、追加测量次数、移动时间 | 验证推荐交会角区间 |
-| 外圈半径 $r$ | 1100 至 1250 m，步长 25 m | 最坏覆盖距离、巡回长度 | 优化七点覆盖构造 |
+| 参数                        |                  建议取值 | 主要观察指标                       | 目的                         |
+| --------------------------- | ------------------------: | ---------------------------------- | ---------------------------- |
+| 安全清除裕量 $\varepsilon$  |           0、1、2、3、5 m | 清除失败率、平均时间、追加测量次数 | 判断精度与效率的权衡         |
+| 定位与移动权重 $\lambda$    |      0、0.1、0.5、1、2、5 | 最坏定位直径、移动距离、总时间     | 验证第二检测点目标函数稳定性 |
+| 候选点空间网格间距 $h$      |        25、50、100、150 m | 最优目标值、运行时间、未覆盖率     | 判断离散精度是否足够         |
+| 定向角离散步长 $\Delta\phi$ |          2°、5°、10°、15° | 独立密网格未覆盖率、检测点数量     | 防止粗网格漏掉最坏方向       |
+| 距离安全裕量 $\eta_r$       |          0、20、50、100 m | 鲁棒覆盖率、检测点数量、路线长度   | 评价集合覆盖的保守程度       |
+| 交会角下限 $\beta_{\min}$   |        30°、45°、60°、75° | 定位直径、追加测量次数、移动时间   | 验证推荐交会角区间           |
+| 外圈半径 $r$                | 1100 至 1250 m，步长 25 m | 最坏覆盖距离、巡回长度             | 优化七点覆盖构造             |
 
 ### 7.2 安全清除裕量分析
 
@@ -725,13 +725,13 @@ $$
 
 ### 8.4 建议对照组
 
-| 对照内容 | 基线方法 | 改进方法 | 主要指标 |
-|---|---|---|---|
-| 第二检测点 | 沿首次示向方向移动 | 极小极大或信息增益选点 | 定位直径、测量次数 |
-| 全向搜索 | 规则栅格扫描 | 七点严格覆盖 | 路线长度、检测次数 |
-| 清除停止 | 仅检查 $D(P)\le40$ | 检查 $R(P)\le20-\varepsilon$ | 清除失败率 |
-| 混合源搜索 | 复用全向七点路线 | 位置—方向鲁棒覆盖 | 漏检率、总时间 |
-| 清除调度 | 全部搜索后统一清除 | 动态插入清除 | 移动距离、总时间 |
+| 对照内容   | 基线方法           | 改进方法                     | 主要指标           |
+| ---------- | ------------------ | ---------------------------- | ------------------ |
+| 第二检测点 | 沿首次示向方向移动 | 极小极大或信息增益选点       | 定位直径、测量次数 |
+| 全向搜索   | 规则栅格扫描       | 七点严格覆盖                 | 路线长度、检测次数 |
+| 清除停止   | 仅检查 $D(P)\le40$ | 检查 $R(P)\le20-\varepsilon$ | 清除失败率         |
+| 混合源搜索 | 复用全向七点路线   | 位置—方向鲁棒覆盖            | 漏检率、总时间     |
+| 清除调度   | 全部搜索后统一清除 | 动态插入清除                 | 移动距离、总时间   |
 
 ---
 
@@ -740,17 +740,17 @@ $$
 ### 9.1 问题一结果表
 
 | 检测点数 | 定位区域顶点数 | 面积 | 直径 $D(P)$ | 最小包围圆半径 $R(P)$ | $R(P)\le D(P)/2$ |
-|---:|---:|---:|---:|---:|---|
+| -------: | -------------: | ---: | ----------: | --------------------: | ---------------- |
 
 ### 9.2 问题二候选点比较表
 
 | 方案 | 第二检测点 | 移动距离 | 最小交会角 | 最坏定位直径 | 定位区域面积 |
-|---|---|---:|---:|---:|---:|
+| ---- | ---------- | -------: | ---------: | -----------: | -----------: |
 
 ### 9.3 问题三和问题四演练统计表
 
 | 策略 | 测试次数 | 平均清除比例 | 最坏清除比例 | 平均定位清除时间 | 平均移动距离 | 平均检测次数 |
-|---|---:|---:|---:|---:|---:|---:|
+| ---- | -------: | -----------: | -----------: | ---------------: | -----------: | -----------: |
 
 只报告平均值不够，至少同时给出标准差和最坏结果。正式测试只有三次，适合按题目表格逐次列出；策略有效性的统计论证应主要来自次数更多的演练测试。
 
@@ -780,24 +780,24 @@ $$
 
 ## 11 建模组需要交付论文组的材料
 
-| 问题 | 至少交付的数据和图 |
-|---|---|
-| 问题 1 | 定位区域顶点、面积、$D(P)$、$R(P)$、最小包围圆圆心、示向锥交会图 |
-| 问题 2 | 候选区域、最优第二检测点、交会角、移动距离、最坏定位直径、候选点热力图 |
-| 问题 3 | 七点坐标和覆盖证明、搜索轨迹、各次演练统计、总时间分解、定位区域收缩图 |
-| 问题 4 | 位置与方向网格参数、安全裕量、独立验证覆盖率、全向基线与鲁棒策略对照结果 |
-| 敏感性分析 | 参数取值表、均值和最坏值、误差棒、网格收敛曲线及参数选择依据 |
+| 问题       | 至少交付的数据和图                                                       |
+| ---------- | ------------------------------------------------------------------------ |
+| 问题 1     | 定位区域顶点、面积、$D(P)$、$R(P)$、最小包围圆圆心、示向锥交会图         |
+| 问题 2     | 候选区域、最优第二检测点、交会角、移动距离、最坏定位直径、候选点热力图   |
+| 问题 3     | 七点坐标和覆盖证明、搜索轨迹、各次演练统计、总时间分解、定位区域收缩图   |
+| 问题 4     | 位置与方向网格参数、安全裕量、独立验证覆盖率、全向基线与鲁棒策略对照结果 |
+| 敏感性分析 | 参数取值表、均值和最坏值、误差棒、网格收敛曲线及参数选择依据             |
 
 ---
 
 ## 12 参考文献
 
 1. 全国大学生数学建模竞赛组委会. 2026 年高教社杯全国大学生数学建模竞赛 B 题：无线电干扰源的快速自动定位与清除. 2026.
-2. Gavish M, Weiss A J. Performance analysis of bearing-only target location algorithms. *IEEE Transactions on Aerospace and Electronic Systems*, 1992, 28(3): 817–828.
-3. Doğançay K, Hmam H. Optimal angular sensor separation for AOA localization. *Signal Processing*, 2008, 88(5): 1248–1260. [DOI](https://doi.org/10.1016/j.sigpro.2007.11.013)
-4. Bishop A N, Fidan B, Anderson B D O, Doğançay K, Pathirana P N. Optimality analysis of sensor-target localization geometries. *Automatica*, 2010, 46(3): 479–492. [DOI](https://doi.org/10.1016/j.automatica.2009.12.003)
-5. Welzl E. Smallest enclosing disks balls and ellipsoids. In: *New Results and New Trends in Computer Science*. LNCS 555. Springer, 1991: 359–370. [DOI](https://doi.org/10.1007/BFb0038202)
-6. Choset H. Coverage for robotics: A survey of recent results. *Annals of Mathematics and Artificial Intelligence*, 2001, 31: 113–126. [DOI](https://doi.org/10.1023/A:1016639210559)
-7. Galceran E, Carreras M. A survey on coverage path planning for robotics. *Robotics and Autonomous Systems*, 2013, 61(12): 1258–1276. [DOI](https://doi.org/10.1016/j.robot.2013.09.004)
-8. Kaelbling L P, Littman M L, Cassandra A R. Planning and acting in partially observable stochastic domains. *Artificial Intelligence*, 1998, 101(1–2): 99–134. [DOI](https://doi.org/10.1016/S0004-3702%2898%2900023-X)
-9. Zhao S, Chen B M, Lee T H. Optimal sensor placement for target localization and tracking in 2D and 3D. *International Journal of Control*, 2013, 86(10): 1687–1704. [DOI](https://doi.org/10.1080/00207179.2013.792605)
+2. Gavish M, Weiss A J. Performance analysis of bearing-only target location algorithms. _IEEE Transactions on Aerospace and Electronic Systems_, 1992, 28(3): 817–828.
+3. Doğançay K, Hmam H. Optimal angular sensor separation for AOA localization. _Signal Processing_, 2008, 88(5): 1248–1260. [DOI](https://doi.org/10.1016/j.sigpro.2007.11.013)
+4. Bishop A N, Fidan B, Anderson B D O, Doğançay K, Pathirana P N. Optimality analysis of sensor-target localization geometries. _Automatica_, 2010, 46(3): 479–492. [DOI](https://doi.org/10.1016/j.automatica.2009.12.003)
+5. Welzl E. Smallest enclosing disks balls and ellipsoids. In: _New Results and New Trends in Computer Science_. LNCS 555. Springer, 1991: 359–370. [DOI](https://doi.org/10.1007/BFb0038202)
+6. Choset H. Coverage for robotics: A survey of recent results. _Annals of Mathematics and Artificial Intelligence_, 2001, 31: 113–126. [DOI](https://doi.org/10.1023/A:1016639210559)
+7. Galceran E, Carreras M. A survey on coverage path planning for robotics. _Robotics and Autonomous Systems_, 2013, 61(12): 1258–1276. [DOI](https://doi.org/10.1016/j.robot.2013.09.004)
+8. Kaelbling L P, Littman M L, Cassandra A R. Planning and acting in partially observable stochastic domains. _Artificial Intelligence_, 1998, 101(1–2): 99–134. [DOI](https://doi.org/10.1016/S0004-3702%2898%2900023-X)
+9. Zhao S, Chen B M, Lee T H. Optimal sensor placement for target localization and tracking in 2D and 3D. _International Journal of Control_, 2013, 86(10): 1687–1704. [DOI](https://doi.org/10.1080/00207179.2013.792605)
