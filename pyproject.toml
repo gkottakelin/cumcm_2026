@@ -5,6 +5,7 @@ requires-python = ">=3.14"
 dependencies = [
     "matplotlib >= 3.10.0",
     "numpy>=2.0.0",
+    "ortools>=9.15.6755",
     "shapely>=2.1.2",
 ]
 
