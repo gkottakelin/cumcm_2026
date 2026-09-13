@@ -849,8 +849,21 @@ class PracticeRunner:
                     flush=True,
                 )
                 for channel in CHANNELS:
-                    if not self.states[channel].cleared:
-                        self._measure(point, channel)
+                    state = self.states[channel]
+                    if state.cleared:
+                        continue
+                    if (
+                        state.pending_clear
+                        or (
+                            state.region_radius is not None
+                            and state.region_radius <= SAFE_CLEAR_RADIUS
+                        )
+                    ):
+                        # Certified: the inserted clear stop will succeed,
+                        # and further bearings cannot improve it -- skip
+                        # the 6 s rescan at every remaining scan point.
+                        continue
+                    self._measure(point, channel)
                 self._schedule_clears(route)
                 if self._detected_channel_count() >= SOURCE_COUNT_CAP:
                     # The problem bounds the source count at 16 (10-16 per
